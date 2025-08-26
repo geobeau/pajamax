@@ -145,24 +145,29 @@ fn gen_service_handle(service: &prost_build::Service, buf: &mut String) {
             frame_len: usize,
         ) -> Result<(), pajamax::error::Error> {{
             use prost::Message;
-            match req_disc {{"
+            let request = match req_disc {{"
     )
     .unwrap();
 
     for (i, m) in service.methods.iter().enumerate() {
         writeln!(
             buf,
-            "{} => {{
-                let request = {}Request::{}({}::decode(req_buf)?);
-                let req_tx = self.0.dispatch_to(&request);
-                pajamax::dispatch::dispatch(req_tx, request, stream_id, frame_len)
-            }}",
+            "{} => {}Request::{}({}::decode(req_buf)?),",
             i, service.name, m.proto_name, m.input_type
         )
         .unwrap();
     }
 
-    writeln!(buf, "d => unreachable!(\"invalid req_disc: {{d}}\"), }} }}").unwrap();
+    writeln!(
+        buf,
+        "       d => unreachable!(\"invalid req_disc: {{d}}\"),
+            }};
+
+            let req_tx = self.0.dispatch_to(&request);
+            pajamax::dispatch::dispatch(req_tx, request, stream_id, frame_len)
+        }}"
+    )
+    .unwrap();
 }
 
 // struct {Service}ShardServer
