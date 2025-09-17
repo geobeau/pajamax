@@ -90,6 +90,7 @@ fn gen_server(service: &prost_build::Service, buf: &mut String) {
             pub fn new(inner: T) -> Self {{ Self(inner) }}
 
             pub fn inner(&self) -> &T {{ &self.0 }}
+            pub fn inner_mut(&mut self) -> &mut T {{ &mut self.0 }}
         }}",
         service.name, service.name, service.name, service.name
     )
@@ -188,9 +189,19 @@ fn gen_shard_server(service: &prost_build::Service, buf: &mut String) {
             #[allow(dead_code)]
             pub fn inner(&self) -> &T {{ &self.0 }}
 
+            // Handle the request and response.
+            #[allow(dead_code)]
             pub fn handle(&mut self, disp_req: pajamax::dispatch::DispatchRequest<{}Request>) {{
-                let response = match disp_req.request {{",
-        service.name, service.name, service.name, service.name, service.name
+                let response = self.handle_request(disp_req.request);
+                disp_req.stream.response(response);
+            }}
+
+            // Handle the request only. The caller should response later.
+            #[allow(dead_code)]
+            pub fn handle_request(&mut self, request: {}Request) -> pajamax::Response<Box<dyn pajamax::ReplyEncode>>
+            {{
+                match request {{",
+        service.name, service.name, service.name, service.name, service.name, service.name
     )
     .unwrap();
 
@@ -206,21 +217,7 @@ fn gen_shard_server(service: &prost_build::Service, buf: &mut String) {
         )
         .unwrap();
     }
-    writeln!(
-        buf,
-        "}};
-
-        let disp_resp = pajamax::dispatch::DispatchResponse {{
-             stream_id: disp_req.stream_id,
-             req_data_len: disp_req.req_data_len,
-             response,
-        }};
-
-        let _ = disp_req.resp_tx.send(disp_resp);
-
-        }} }}"
-    )
-    .unwrap();
+    writeln!(buf, "}} }} }}").unwrap();
 }
 
 // struct {Service}{Method}Reply

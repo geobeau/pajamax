@@ -40,4 +40,6 @@ pub enum Code {
     Unavailable = 14,
     DataLoss = 15,
     Unauthenticated = 16,
+
+    DispatchPending = 101,
 }

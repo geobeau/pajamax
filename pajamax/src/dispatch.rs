@@ -25,20 +25,48 @@ type ResponseRx = mpsc::Receiver<DispatchResponse>;
 
 /// Dispatched request in dispatch mode.
 pub struct DispatchRequest<Req> {
-    pub stream_id: u32,
-    pub req_data_len: usize,
+    pub stream: DispatchStream,
     pub request: Req,
-    pub resp_tx: ResponseTx,
 }
 
 /// Dispatched response in dispatch mode.
 pub struct DispatchResponse {
-    pub stream_id: u32,
-    pub req_data_len: usize,
+    stream_id: u32,
+    req_data_len: usize,
 
     // We use dynamic-dispatch `dyn` here to accept different
     // response from multiple services in one channel.
-    pub response: Response<Box<dyn ReplyEncode>>,
+    response: Response<Box<dyn ReplyEncode>>,
+}
+
+/// Stream context.
+///
+/// If your handler does not response immediately, you should return the
+/// `status::Code::DispatchPending`, then the `{XX}ShardServer::handle()`
+/// will return this `Stream`. You can use it later to response
+/// when you are ready.
+pub struct DispatchStream {
+    stream_id: u32,
+    req_data_len: usize,
+    resp_tx: ResponseTx,
+}
+
+impl DispatchStream {
+    fn new(stream_id: u32, req_data_len: usize) -> Self {
+        Self {
+            stream_id,
+            req_data_len,
+            resp_tx: RESP_TX.with_borrow(|tx| tx.clone()),
+        }
+    }
+    pub fn response(self, response: Response<Box<dyn ReplyEncode>>) {
+        let disp_resp = DispatchResponse {
+            stream_id: self.stream_id,
+            req_data_len: self.req_data_len,
+            response,
+        };
+        let _ = self.resp_tx.send(disp_resp);
+    }
 }
 
 thread_local! {
@@ -68,12 +96,8 @@ pub fn dispatch<Req>(
 ) -> Result<(), Error> {
     trace!("dispatch request id:{stream_id}");
 
-    let disp_req = DispatchRequest {
-        request,
-        stream_id,
-        req_data_len,
-        resp_tx: RESP_TX.with_borrow(|tx| tx.clone()),
-    };
+    let stream = DispatchStream::new(stream_id, req_data_len);
+    let disp_req = DispatchRequest { stream, request };
 
     match req_tx.try_send(disp_req) {
         Ok(_) => Ok(()),
@@ -132,4 +156,19 @@ fn response_receive(
 
     // wait in blocking mode
     Ok(resp_rx.recv()?)
+}
+
+pub fn dispatch_pending<T>() -> Response<T> {
+    Err(Status {
+        code: Code::DispatchPending,
+        message: String::new(),
+    })
+}
+
+pub fn is_dispatch_pending(resp: &Response<Box<dyn ReplyEncode>>) -> bool {
+    if let Err(status) = resp {
+        status.code == Code::DispatchPending
+    } else {
+        false
+    }
 }
