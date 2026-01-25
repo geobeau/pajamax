@@ -6,7 +6,6 @@ pub fn generate(service: prost_build::Service, buf: &mut String) {
     gen_request_type(&service, buf);
     gen_server(&service, buf);
     gen_shard_server(&service, buf);
-    gen_reply_structs(&service, buf);
 }
 
 // trait {Service}Dispatch
@@ -143,7 +142,6 @@ fn gen_service_handle(service: &prost_build::Service, buf: &mut String) {
             req_disc: usize,
             req_buf: &[u8],
             stream_id: u32,
-            frame_len: usize,
         ) -> Result<(), pajamax::error::Error> {{
             use prost::Message;
             let request = match req_disc {{"
@@ -165,7 +163,7 @@ fn gen_service_handle(service: &prost_build::Service, buf: &mut String) {
             }};
 
             let req_tx = self.0.dispatch_to(&request);
-            pajamax::dispatch::dispatch(req_tx, request, stream_id, frame_len)
+            pajamax::dispatch::dispatch(req_tx, request, stream_id)
         }}"
     )
     .unwrap();
@@ -189,6 +187,9 @@ fn gen_shard_server(service: &prost_build::Service, buf: &mut String) {
             #[allow(dead_code)]
             pub fn inner(&self) -> &T {{ &self.0 }}
 
+            #[allow(dead_code)]
+            pub fn inner_mut(&mut self) -> &mut T {{ &mut self.0 }}
+
             // Handle the request and response.
             #[allow(dead_code)]
             pub fn handle(&mut self, disp_req: pajamax::dispatch::DispatchRequest<{}Request>) {{
@@ -211,33 +212,11 @@ fn gen_shard_server(service: &prost_build::Service, buf: &mut String) {
             buf,
             "{}Request::{}(request) => {{
                 self.0.{}(request).map(|reply|
-                    Box::new({}{}Reply(reply)) as Box<dyn pajamax::ReplyEncode>)
+                    Box::new(reply) as Box<dyn pajamax::ReplyEncode>)
             }}",
-            service.name, m.proto_name, m.name, service.name, m.proto_name
+            service.name, m.proto_name, m.name
         )
         .unwrap();
     }
     writeln!(buf, "}} }} }}").unwrap();
-}
-
-// struct {Service}{Method}Reply
-//
-// Since prost::Message is not object-safe, we need to define `trait ReplyEncode`
-// to work around this. Here we define may reply structs and implement
-// ReplyEncode for all of them.
-fn gen_reply_structs(service: &prost_build::Service, buf: &mut String) {
-    for m in service.methods.iter() {
-        writeln!(
-            buf,
-            "struct {}{}Reply({});
-            impl pajamax::ReplyEncode for {}{}Reply {{
-                fn encode(&self, output: &mut Vec<u8>) -> Result<(), prost::EncodeError> {{
-                    use prost::Message;
-                    self.0.encode(output)
-                }}
-            }}",
-            service.name, m.proto_name, m.output_type, service.name, m.proto_name
-        )
-        .unwrap();
-    }
 }

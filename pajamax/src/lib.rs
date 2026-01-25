@@ -204,13 +204,7 @@ pub trait PajamaxService {
     // to abstract exactly same routine for both local-mode and
     // dispatch-mode. So we move the implemention to pajamax-build
     // crate.
-    fn handle(
-        &self,
-        req_disc: usize,
-        req_buf: &[u8],
-        stream_id: u32,
-        data_len: usize,
-    ) -> Result<(), error::Error>;
+    fn handle(&self, req_disc: usize, req_buf: &[u8], stream_id: u32) -> Result<(), error::Error>;
 
     // Take `self` for object-safe.
     fn is_dispatch_mode(&self) -> bool;

@@ -69,16 +69,11 @@ struct Stream {
 }
 
 // response in local thread
-pub fn local_build_response<Reply>(
-    stream_id: u32,
-    response: Response<Reply>,
-    req_data_len: usize,
-) -> Result<(), Error>
+pub fn local_build_response<Reply>(stream_id: u32, response: Response<Reply>) -> Result<(), Error>
 where
     Reply: prost::Message,
 {
-    RESPONSE_END
-        .with_borrow_mut(|resp_end| Ok(resp_end.build(stream_id, response, req_data_len)?))
+    RESPONSE_END.with_borrow_mut(|resp_end| Ok(resp_end.build(stream_id, response)?))
 }
 
 // handle each connection on a new thread
@@ -126,6 +121,8 @@ pub fn handle(
             return Ok(());
         }
         let end = last_end + len;
+
+        let mut data_len = 0;
 
         let mut pos = 0;
         while let Some(frame) = Frame::parse(&input[pos..end]) {
@@ -199,13 +196,18 @@ pub fn handle(
                     trace!("handle isvc:{isvc}, req_disc:{req_disc}");
 
                     // handle request
-                    services[isvc].handle(req_disc, req_buf, id, frame.len as usize)?;
+                    services[isvc].handle(req_disc, req_buf, id)?;
+
+                    data_len += frame.len;
                 }
                 _ => (),
             }
         }
 
-        RESPONSE_END.with_borrow_mut(|resp_end| resp_end.flush())?;
+        RESPONSE_END.with_borrow_mut(|resp_end| {
+            resp_end.window_update(data_len);
+            resp_end.flush()
+        })?;
 
         // for next loop
         if pos == 0 {

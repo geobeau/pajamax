@@ -11,7 +11,6 @@ use crate::Response;
 pub struct ResponseEnd {
     c: Arc<Mutex<TcpStream>>,
     req_count: usize,
-    req_data_len: usize,
     hpack_encoder: Encoder,
     output: Vec<u8>,
 
@@ -24,7 +23,6 @@ impl ResponseEnd {
         Self {
             c,
             req_count: 0,
-            req_data_len: 0,
             hpack_encoder: Encoder::new(),
             output: Vec::with_capacity(config.max_flush_size),
 
@@ -39,7 +37,6 @@ impl ResponseEnd {
         &mut self,
         stream_id: u32,
         response: Response<Reply>,
-        req_data_len: usize,
     ) -> Result<(), std::io::Error>
     where
         Reply: prost::Message,
@@ -58,7 +55,7 @@ impl ResponseEnd {
             }
         }
 
-        self.update(req_data_len)
+        self.update()
     }
 
     // build response to output buffer
@@ -68,7 +65,6 @@ impl ResponseEnd {
         &mut self,
         stream_id: u32,
         response: Response<Box<dyn http2::ReplyEncode>>,
-        req_data_len: usize,
     ) -> Result<(), std::io::Error> {
         match response {
             Ok(reply) => {
@@ -84,12 +80,11 @@ impl ResponseEnd {
             }
         }
 
-        self.update(req_data_len)
+        self.update()
     }
 
-    fn update(&mut self, req_data_len: usize) -> Result<(), std::io::Error> {
+    fn update(&mut self) -> Result<(), std::io::Error> {
         self.req_count += 1;
-        self.req_data_len += req_data_len;
 
         if self.req_count >= self.max_flush_requests || self.output.len() >= self.max_flush_size {
             self.flush()
@@ -110,13 +105,16 @@ impl ResponseEnd {
             self.output.len()
         );
 
-        http2::build_window_update(self.req_data_len, &mut self.output);
-
         self.c.lock().unwrap().write_all(&self.output)?;
 
         self.output.clear();
         self.req_count = 0;
-        self.req_data_len = 0;
         Ok(())
+    }
+
+    pub fn window_update(&mut self, data_len: usize) {
+        if data_len > 0 {
+            http2::build_window_update(data_len, &mut self.output);
+        }
     }
 }

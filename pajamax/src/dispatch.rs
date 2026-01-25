@@ -32,7 +32,6 @@ pub struct DispatchRequest<Req> {
 /// Dispatched response in dispatch mode.
 pub struct DispatchResponse {
     stream_id: u32,
-    req_data_len: usize,
 
     // We use dynamic-dispatch `dyn` here to accept different
     // response from multiple services in one channel.
@@ -47,22 +46,19 @@ pub struct DispatchResponse {
 /// when you are ready.
 pub struct DispatchStream {
     stream_id: u32,
-    req_data_len: usize,
     resp_tx: ResponseTx,
 }
 
 impl DispatchStream {
-    fn new(stream_id: u32, req_data_len: usize) -> Self {
+    fn new(stream_id: u32) -> Self {
         Self {
             stream_id,
-            req_data_len,
             resp_tx: RESP_TX.with_borrow(|tx| tx.clone()),
         }
     }
     pub fn response(self, response: Response<Box<dyn ReplyEncode>>) {
         let disp_resp = DispatchResponse {
             stream_id: self.stream_id,
-            req_data_len: self.req_data_len,
             response,
         };
         let _ = self.resp_tx.send(disp_resp);
@@ -88,15 +84,10 @@ pub fn new_response_routine(c: Arc<Mutex<TcpStream>>, config: &Config) {
 }
 
 // dispatch the request to req_tx
-pub fn dispatch<Req>(
-    req_tx: &RequestTx<Req>,
-    request: Req,
-    stream_id: u32,
-    req_data_len: usize,
-) -> Result<(), Error> {
+pub fn dispatch<Req>(req_tx: &RequestTx<Req>, request: Req, stream_id: u32) -> Result<(), Error> {
     trace!("dispatch request id:{stream_id}");
 
-    let stream = DispatchStream::new(stream_id, req_data_len);
+    let stream = DispatchStream::new(stream_id);
     let disp_req = DispatchRequest { stream, request };
 
     match req_tx.try_send(disp_req) {
@@ -114,7 +105,7 @@ pub fn dispatch<Req>(
                 },
             };
             let response: Response<()> = Err(status);
-            local_build_response(stream_id, response, req_data_len)
+            local_build_response(stream_id, response)
         }
     }
 }
@@ -124,7 +115,7 @@ fn response_routine(mut resp_end: ResponseEnd, resp_rx: ResponseRx) -> Result<()
     loop {
         let resp = response_receive(&mut resp_end, &resp_rx)?;
         trace!("receive dispatched response {}", resp.stream_id);
-        resp_end.build_box(resp.stream_id, resp.response, resp.req_data_len)?;
+        resp_end.build_box(resp.stream_id, resp.response)?;
     }
 }
 
@@ -158,14 +149,14 @@ fn response_receive(
     Ok(resp_rx.recv()?)
 }
 
-pub fn dispatch_pending<T>() -> Response<T> {
+pub fn pending<T>() -> Response<T> {
     Err(Status {
         code: Code::DispatchPending,
         message: String::new(),
     })
 }
 
-pub fn is_dispatch_pending(resp: &Response<Box<dyn ReplyEncode>>) -> bool {
+pub fn is_pending(resp: &Response<Box<dyn ReplyEncode>>) -> bool {
     if let Err(status) = resp {
         status.code == Code::DispatchPending
     } else {

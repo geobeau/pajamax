@@ -87,7 +87,6 @@ fn gen_service_handle(service: &prost_build::Service, buf: &mut String) {
             req_disc: usize,
             req_buf: &[u8],
             stream_id: u32,
-            frame_len: usize,
         ) -> Result<(), pajamax::error::Error> {{
             use prost::Message;
             match req_disc {{"
@@ -100,7 +99,7 @@ fn gen_service_handle(service: &prost_build::Service, buf: &mut String) {
             "{} => {{
                 let request = {}::decode(req_buf)?;
                 let response = self.0.{}(request);
-                pajamax::local_build_response(stream_id, response, frame_len)
+                pajamax::local_build_response(stream_id, response)
             }}",
             i, m.input_type, m.name
         )

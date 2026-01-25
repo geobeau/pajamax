@@ -300,3 +300,9 @@ fn build_u16(n: u16, buf: &mut [u8]) {
 pub trait ReplyEncode: Send {
     fn encode(&self, output: &mut Vec<u8>) -> Result<(), prost::EncodeError>;
 }
+
+impl<T: prost::Message> ReplyEncode for T {
+    fn encode(&self, output: &mut Vec<u8>) -> Result<(), prost::EncodeError> {
+        prost::Message::encode(self, output)
+    }
+}
