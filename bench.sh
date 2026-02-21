@@ -1,0 +1,4 @@
+taskset -ca 16-24 ghz --proto=examples/proto/helloworld.proto  --call helloworld.Greeter/SayHello  -d '{"name": "world"}' --insecure     --connections=1000   --cpus=8 -c 10000     -z 20s  127.0.0.1:50051 &
+taskset -ca 24-32 ghz --proto=examples/proto/helloworld.proto  --call helloworld.Greeter/SayHello  -d '{"name": "world"}' --insecure     --connections=1000   --cpus=8 -c 10000     -z 20s  127.0.0.1:50051 &
+taskset -ca 32-48 ghz --proto=examples/proto/helloworld.proto  --call helloworld.Greeter/SayHello  -d '{"name": "world"}' --insecure     --connections=1000   --cpus=8 -c 10000     -z 20s  127.0.0.1:50051 & 
+taskset -ca 48-63 ghz --proto=examples/proto/helloworld.proto  --call helloworld.Greeter/SayHello  -d '{"name": "world"}' --insecure     --connections=1000   --cpus=8 -c 10000     -z 20s  127.0.0.1:50051 

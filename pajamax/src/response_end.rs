@@ -1,6 +1,6 @@
-use std::io::Write;
-use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use compio::io::AsyncWriteExt;
+use compio::net::{OwnedWriteHalf, TcpStream};
+use compio::BufResult;
 
 use crate::config::Config;
 use crate::hpack_encoder::Encoder;
@@ -8,113 +8,134 @@ use crate::http2;
 use crate::macros::*;
 use crate::Response;
 
-pub struct ResponseEnd {
-    c: Arc<Mutex<TcpStream>>,
-    req_count: usize,
-    hpack_encoder: Encoder,
-    output: Vec<u8>,
-
-    max_flush_requests: usize,
-    max_flush_size: usize,
+/// A response job sent from handlers to the writer task.
+pub enum RespJob {
+    /// Successful reply: encode the message into the output buffer.
+    Reply {
+        stream_id: u32,
+        encode_fn: Box<dyn FnOnce(&mut Vec<u8>)>,
+    },
+    /// Error status response.
+    Status {
+        stream_id: u32,
+        status: crate::status::Status,
+    },
+    /// Window update after consuming DATA frames.
+    WindowUpdate {
+        len: usize,
+    },
+    /// Flush the output buffer now.
+    Flush,
 }
 
-impl ResponseEnd {
-    pub fn new(c: Arc<Mutex<TcpStream>>, config: &Config) -> Self {
-        Self {
-            c,
-            req_count: 0,
-            hpack_encoder: Encoder::new(),
-            output: Vec::with_capacity(config.max_flush_size),
+/// The response sender that handlers use to submit responses.
+/// Uses unbounded channel so send is synchronous (non-async).
+pub type RespTx = local_sync::mpsc::unbounded::Tx<RespJob>;
+pub type RespRx = local_sync::mpsc::unbounded::Rx<RespJob>;
 
-            max_flush_requests: config.max_flush_requests,
-            max_flush_size: config.max_flush_size,
-        }
-    }
+/// Create a response channel pair.
+pub fn resp_channel() -> (RespTx, RespRx) {
+    local_sync::mpsc::unbounded::channel()
+}
 
-    // build response to output buffer
-    // Used in local-mode.
-    pub fn build<Reply>(
-        &mut self,
-        stream_id: u32,
-        response: Response<Reply>,
-    ) -> Result<(), std::io::Error>
-    where
-        Reply: prost::Message,
-    {
-        match response {
-            Ok(reply) => {
+/// The writer task that owns the write half of the TCP connection.
+/// It drains the response channel and flushes batched output.
+pub async fn writer_task(
+    mut writer: OwnedWriteHalf<TcpStream>,
+    mut resp_rx: RespRx,
+    config: Config,
+) -> Result<(), crate::error::Error> {
+    let mut hpack_encoder = Encoder::new();
+    let mut output: Vec<u8> = Vec::with_capacity(config.max_flush_size);
+    let mut req_count: usize = 0;
+
+    while let Some(job) = resp_rx.recv().await {
+        let should_flush = matches!(&job, RespJob::Flush | RespJob::WindowUpdate { .. });
+
+        match job {
+            RespJob::Reply {
+                stream_id,
+                encode_fn,
+            } => {
                 http2::build_response(
                     stream_id,
-                    |output| reply.encode(output).unwrap(),
-                    &mut self.hpack_encoder,
-                    &mut self.output,
+                    encode_fn,
+                    &mut hpack_encoder,
+                    &mut output,
                 );
+                req_count += 1;
             }
-            Err(status) => {
-                http2::build_status(stream_id, status, &mut self.hpack_encoder, &mut self.output);
+            RespJob::Status { stream_id, status } => {
+                http2::build_status(stream_id, status, &mut hpack_encoder, &mut output);
+                req_count += 1;
             }
+            RespJob::WindowUpdate { len } => {
+                if len > 0 {
+                    http2::build_window_update(len, &mut output);
+                }
+            }
+            RespJob::Flush => {}
         }
 
-        self.update()
-    }
-
-    // build response to output buffer
-    // Used in dispatch-mode. We use dynamic-dispatch `dyn` here
-    // to accept different response from multiple services.
-    pub fn build_box(
-        &mut self,
-        stream_id: u32,
-        response: Response<Box<dyn http2::ReplyEncode>>,
-    ) -> Result<(), std::io::Error> {
-        match response {
-            Ok(reply) => {
-                http2::build_response(
-                    stream_id,
-                    |output| reply.encode(output).unwrap(),
-                    &mut self.hpack_encoder,
-                    &mut self.output,
-                );
-            }
-            Err(status) => {
-                http2::build_status(stream_id, status, &mut self.hpack_encoder, &mut self.output);
+        if req_count >= config.max_flush_requests
+            || output.len() >= config.max_flush_size
+            || should_flush
+        {
+            if !output.is_empty() {
+                trace!("flush response count:{} len:{}", req_count, output.len());
+                let BufResult(res, buf) = writer.write_all(output).await;
+                res?;
+                output = buf;
+                output.clear();
+                req_count = 0;
             }
         }
-
-        self.update()
     }
 
-    fn update(&mut self) -> Result<(), std::io::Error> {
-        self.req_count += 1;
-
-        if self.req_count >= self.max_flush_requests || self.output.len() >= self.max_flush_size {
-            self.flush()
-        } else {
-            Ok(())
-        }
+    // flush remaining
+    if !output.is_empty() {
+        let BufResult(res, _) = writer.write_all(output).await;
+        res?;
     }
 
-    // flush the output buffer
-    pub fn flush(&mut self) -> Result<(), std::io::Error> {
-        if self.output.len() == 0 {
-            return Ok(());
-        }
+    Ok(())
+}
 
-        trace!(
-            "flush response count:{} len:{}",
-            self.req_count,
-            self.output.len()
-        );
+/// Helper to build and send a successful response through the channel.
+pub fn send_response<Reply>(
+    resp_tx: &RespTx,
+    stream_id: u32,
+    response: Response<Reply>,
+) -> Result<(), crate::error::Error>
+where
+    Reply: prost::Message + 'static,
+{
+    let job = match response {
+        Ok(reply) => RespJob::Reply {
+            stream_id,
+            encode_fn: Box::new(move |output| reply.encode(output).unwrap()),
+        },
+        Err(status) => RespJob::Status { stream_id, status },
+    };
+    resp_tx
+        .send(job)
+        .map_err(|_| crate::error::Error::ChannelClosed)
+}
 
-        self.c.lock().unwrap().write_all(&self.output)?;
-
-        self.output.clear();
-        self.req_count = 0;
-        Ok(())
-    }
-
-    pub fn window_update(&mut self, data_len: usize) {
-        if data_len > 0 {
-            http2::build_window_update(data_len, &mut self.output);
-        }
-    }
+/// Helper to build and send a boxed response (for dispatch mode).
+pub fn send_response_box(
+    resp_tx: &RespTx,
+    stream_id: u32,
+    response: Response<Box<dyn http2::ReplyEncode>>,
+) -> Result<(), crate::error::Error> {
+    let job = match response {
+        Ok(reply) => RespJob::Reply {
+            stream_id,
+            encode_fn: Box::new(move |output| reply.encode(output).unwrap()),
+        },
+        Err(status) => RespJob::Status { stream_id, status },
+    };
+    resp_tx
+        .send(job)
+        .map_err(|_| crate::error::Error::ChannelClosed)
 }

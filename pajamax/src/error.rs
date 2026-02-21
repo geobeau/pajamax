@@ -16,12 +16,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<std::sync::mpsc::RecvError> for Error {
-    fn from(_: std::sync::mpsc::RecvError) -> Self {
-        Self::ChannelClosed
-    }
-}
-
 impl From<prost::DecodeError> for Error {
     fn from(de: prost::DecodeError) -> Self {
         Self::InvalidProtobuf(de)

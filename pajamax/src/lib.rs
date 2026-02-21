@@ -1,40 +1,21 @@
-//! Super fast gRPC server framework in synchronous mode.
+//! Super fast gRPC server framework built on compio.
 //!
-//! I used and benchmarked the `tonic` in a network server project.
-//! Surprisingly, I found that its performance is not as good as I expected,
-//! with most of the cost being in the `tokio` asynchronous runtime and HTTP/2
-//! protocol parsing. So I want to implement a higher-performance gRPC service
-//! framework by solving the above two problems.
+//! Pajamax is a high-performance gRPC server framework that uses compio's
+//! completion-based async runtime with a thread-per-core model for maximum
+//! throughput.
 //!
-//! # Optimization: Synchronous
+//! # Architecture
 //!
-//! Asynchronous programming is very suitable for network applications. I love it,
-//! but not here. `tokio` is fast but not zero-cost. For some gRPC servers in
-//! certain scenarios, synchronous programming may be more appropriate:
-//!
-//! - Some business logic operates synchronously, allowing it to respond to
-//!   requests immediately. Consequently, concurrent requests essentially
-//!   line up in a pipeline here.
-//!
-//! - gRPC utilizes HTTP/2, which supports multiplexing. This means that even
-//!   though each client can make multiple concurrent requests, only one single
-//!   connection to the server is established. For internal services served
-//!   behind a fixed number of gateway machines, the number of connections they
-//!   handle remains limited and relatively small.
-//!
-//! In this case, the more straightforward **thread model** may be more suitable
-//! than asynchronous model.
-//! Spawn a thread for each connection. The code is synchronous inside each thread.
-//! It receives requests and responds immediately, without employing `async` code
-//! or any `tokio` components. Since the connections are very stable, there
-//! is even no need to use a thread pool.
+//! Pajamax uses compio's thread-per-core model where each core runs its own
+//! event loop with io_uring/iocp/polling. Each accepted TCP connection is
+//! handled by an async task on the core that accepted it. This avoids
+//! cross-thread synchronization and maximizes cache locality.
 //!
 //! # Optimization: Deep into HTTP/2
 //!
 //! gRPC runs over HTTP/2. gRPC and HTTP/2 are independent layers, and they SHOULD
-//! also be independent in implementation, such as `tonic` and `h2` are two separate
-//! crates. However, this independence also leads to performance waste, mainly
-//! in the processing of request headers.
+//! also be independent in implementation. However, this independence also leads
+//! to performance waste, mainly in the processing of request headers.
 //!
 //! - Typically, a standard HTTP/2 implementation must parse all request headers
 //!   and return them to the upper-level application. But in a gRPC service, at
@@ -46,123 +27,25 @@
 //!   in the specific scenario of gRPC, we can process directly on
 //!   parsing `:path` in HTTP/2, thereby avoiding the memory allocation.
 //!
-//! To this end, we can implement an HTTP/2 library specifically designed for gRPC.
-//! While "reducing coupling" is a golden rule in programming, there are exceptional
-//! cases where it can be strategically overlooked for specific purposes.
-//!
-//! # Benchmark
-//!
-//! The above two optimizations eliminate the cost of the asynchronous runtime
-//! and reduce the cost of HTTP/2 protocol parsing, resulting in a significant
-//! performance improvement.
-//!
-//! We measured that Pajamax is up to at most 10X faster than Tonic using
-//! `grpc-bench` project.  See the
-//! [result](https://github.com/WuBingzheng/pajamax/blob/main/benchmark)
-//! for details.
-//!
-//! # Conclusion
-//!
-//! Scenario limitations:
-//!
-//! - Synchronous business logical (but see the *Dispatch* mode below);
-//! - Deployed in internal environment, behind the gateway and not directly exposed to the outside.
-//!
-//! Benefits:
-//!
-//! - At most 10X performance improvement;
-//! - No asynchronous programming;
-//! - Less dependencies, less compilation time, less executable size.
-//!
-//! Loss:
-//!
-//! - No gRPC Streaming mode, but only Unary mode;
-//! - No gRPC headers, such as `grpc-timeout`;
-//! - No `tower`'s ecosystem of middleware, services, and utilities, compared to `tonic`;
-//! - maybe something else.
-//!
-//! It's like pajamas, super comfortable and convenient to wear, but only
-//! suitable at home, not for going out in public.
-//!
 //! # Modes: Local and Dispatch
 //!
-//! The business logic code discussed above is all synchronous. There is
-//! only one thread for each connection. We call it *Local* mode.
-//! The architecture is very simple, as shown in the figure below.
+//! ## Local Mode
 //!
-//! ```text
-//!         /-----------------------\
-//!        (      TCP connection     )
-//!         \--^-----------------+--/
-//!            |                 |
-//!            |send             |recv
-//!      +=====+=================V=====+
-//!      |                             |
-//!      |      application codes      |
-//!      |                             |
-//!      +===========pajamax framework=+
-//! ```
+//! The handler runs inline in the connection task. Simple and fast.
 //!
-//! We also support another mode, *Dispatch* mode. This involves multiple threads:
+//! ## Dispatch Mode
 //!
-//! - one input thread, which receives TCP data, parses requests, and dispatches
-//!   them to the specified backend threads according to user definitions;
-//! - the backend threads are managed by the user themselves; They handle the
-//!   requests and generate responses, just like in the *Local* mode;
-//! - one output thread, which encodes responses and sends the data.
-//!
-//! The requests and responses are transfered by channels. The architecture is
-//! shown in the figure below.
-//!
-//! ```text
-//!         /-----------------------\
-//!        (      TCP connection     )
-//!         \--^-----------------+--/
-//!            |                 |
-//!            |send             |recv
-//!    +=======+======+  +=======V=======+
-//!    |    encode    |  |    decode     |
-//!    |       |      |  |   dispatch    |
-//!    +=======+======+  +=======+=======+
-//!            |                 |
-//!      +=====+=================V====+
-//!      |                            |+
-//!      |     application codes      ||+
-//!      |                            |||
-//!      +============================+||
-//!       +============================+|
-//!        +============================+
-//! ```
-//!
-//! Applications only need to implement 2 traits to define how to dispatch
-//! requests and how to handle requests. You do not need to handle the
-//! message transfer or encoding, which will be handled by Pajamax.
-//!
-//! See the [dict-store](https://github.com/WuBingzheng/pajamax/blob/main/examples/src/dict_store.rs)
-//! example for more details.
-//!
-//! Each service has one mode, but you can mix services with different modes
-//! in one server.
+//! Requests are dispatched to worker tasks via async channels on the same
+//! core. Useful when you need to shard mutable state across workers.
 //!
 //! # Usage
+//!
 //! The usage of Pajamax is very similar to that of Tonic.
 //!
 //! See [`pajamax-build`](https://docs.rs/pajamax-build) crate document for more detail.
-//!
-//! This crate exports many items, but most are used by `pajamx-build` crate.
-//! While applications need not to access them.
-//!
-//! # Status
-//!
-//! Now Pajamax is still in the development stage. I publish it to get feedback.
-//!
-//! Todo list:
-//!
-//! - More test;
-//! - Hooks like tower's Layer.
 
 mod config;
-mod connection;
+pub mod connection;
 mod hpack_decoder;
 mod hpack_encoder;
 mod http2;
@@ -180,7 +63,7 @@ pub mod status;
 pub use config::{Config, ConfigedServer};
 
 #[doc(hidden)]
-pub use connection::local_build_response;
+pub use response_end::{send_response, RespTx};
 #[doc(hidden)]
 pub use http2::ReplyEncode;
 
@@ -189,23 +72,16 @@ pub type Response<Reply> = Result<Reply, status::Status>;
 
 #[doc(hidden)]
 /// Used by pajamax-build crate.
+#[async_trait::async_trait(?Send)]
 pub trait PajamaxService {
     // Route the path to request enum discriminant as usize.
-    // It does not return the request enum itself because
-    // of multiple services have different requests.
     fn route(&self, path: &[u8]) -> Option<usize>;
 
     // Handle the request:
     // 1. parse the request from req_disc(from route()) and req_buf,
     // 2. call the method defined in applications and make reply,
-    // 3. response the reply to resp_end.
-    //
-    // We merge these steps into one function because it's difficult
-    // to abstract exactly same routine for both local-mode and
-    // dispatch-mode. So we move the implemention to pajamax-build
-    // crate.
-    fn handle(&self, req_disc: usize, req_buf: &[u8], stream_id: u32) -> Result<(), error::Error>;
+    // 3. response the reply to resp_tx.
+    async fn handle(&self, req_disc: usize, req_buf: &[u8], stream_id: u32, resp_tx: &response_end::RespTx) -> Result<(), error::Error>;
 
-    // Take `self` for object-safe.
     fn is_dispatch_mode(&self) -> bool;
 }

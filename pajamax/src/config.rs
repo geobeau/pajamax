@@ -1,5 +1,4 @@
-use std::net::ToSocketAddrs;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use crate::PajamaxService;
@@ -20,47 +19,41 @@ use crate::PajamaxService;
 /// ```
 pub struct ConfigedServer {
     pub(crate) config: Config,
-    pub(crate) services: Vec<Arc<dyn PajamaxService + Send + Sync + 'static>>,
+    pub(crate) services: Vec<Box<dyn Fn() -> Rc<dyn PajamaxService> + Send + Sync>>,
 }
 
 impl ConfigedServer {
     /// Add more services.
-    pub fn add_service<S>(mut self, svc: S) -> Self
+    pub fn add_service<S, F>(mut self, factory: F) -> Self
     where
-        S: crate::PajamaxService + Send + Sync + 'static,
+        F: Fn() -> S + Send + Sync + 'static,
+        S: PajamaxService + 'static,
     {
-        self.services.push(Arc::new(svc));
+        self.services.push(Box::new(move || Rc::new(factory())));
         self
     }
 
-    /// Start the server!
-    pub fn serve<A>(self, addr: A) -> std::io::Result<()>
-    where
-        A: ToSocketAddrs,
-    {
-        crate::connection::serve_with_config(self.services, self.config, addr)
+    /// Start a listener on the current compio runtime.
+    ///
+    /// This is an async function that must be called from within a compio runtime.
+    /// The caller is responsible for creating compio runtimes and threads.
+    pub async fn listen(self, addr: &str) -> std::io::Result<()> {
+        let services: Vec<Rc<dyn crate::PajamaxService>> =
+            self.services.iter().map(|f| f()).collect();
+        crate::connection::accept_loop(services, self.config, addr.to_string()).await
+    }
+
+    /// Start the server with built-in thread-per-core compio runtimes.
+    ///
+    /// Convenience method that creates compio runtimes and blocks the calling thread.
+    pub fn serve(self, addr: &str) -> std::io::Result<()> {
+        crate::connection::serve_with_config(self.services, self.config, addr.to_string())
     }
 }
 
 /// Configure the server.
-///
-/// Generally you should:
-///
-/// 1. first call the [`Self::new`] to create a configuration instance,
-/// 2. then call some methods to configure options,
-/// 3. finally call [`Self::add_service`] to add the first service and get a [`ConfigedServer`].
-///
-/// # Examples
-///
-/// ```
-/// pajamax::Config::new()
-///     .max_concurrent_connections(2000) // config some option
-///     .add_service(GreeterServer::new(greeter))  // return ConfigedServer
-///     .add_service(Greeter2Server::new(greeter2))
-///     .serve(addr)
-///     .unwrap();
-/// ```
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct Config {
     pub(crate) max_concurrent_connections: usize,
     pub(crate) max_concurrent_streams: usize,
@@ -69,6 +62,7 @@ pub struct Config {
     pub(crate) max_flush_size: usize,
     pub(crate) idle_timeout: Duration,
     pub(crate) write_timeout: Duration,
+    pub(crate) num_cores: usize,
 }
 
 impl Config {
@@ -82,17 +76,10 @@ impl Config {
             max_flush_size: 15000,
             idle_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            num_cores: 1,
         }
     }
 
-    /// Since we create 1 (in Local mode) or 2 (in Dispatch mode) threads
-    /// for each connection, so do not set this too big.
-    ///
-    /// Besides, the less connections, the high concurrent streams per
-    /// connection, the more efficient batch processing. So you'd better
-    /// keep the concurrent connections as low as possible.
-    ///
-    /// Default: 100
     pub fn max_concurrent_connections(self, n: usize) -> Self {
         Self {
             max_concurrent_connections: n,
@@ -100,14 +87,6 @@ impl Config {
         }
     }
 
-    /// Limit for each connection.
-    ///
-    /// We just send this HTTP2 setting to clients and hope them respect it.
-    /// We do not check or limit this actually for simplicity.
-    /// This is Ok because pajamax should be used only by internal service
-    /// whose clients are also insiders but not external users.
-    ///
-    /// Default: 1000
     pub fn max_concurrent_streams(self, n: usize) -> Self {
         Self {
             max_concurrent_streams: n,
@@ -115,7 +94,6 @@ impl Config {
         }
     }
 
-    /// Default: 16 * 1024
     pub fn max_frame_size(self, n: usize) -> Self {
         Self {
             max_frame_size: n,
@@ -123,9 +101,6 @@ impl Config {
         }
     }
 
-    /// Flush the response direction at most this number requests.
-    ///
-    /// Default: 50
     pub fn max_flush_requests(self, n: usize) -> Self {
         Self {
             max_flush_requests: n,
@@ -133,19 +108,13 @@ impl Config {
         }
     }
 
-    /// Flush the response direction at most this size data.
-    ///
-    /// Default: 15000
     pub fn max_flush_size(self, n: usize) -> Self {
         Self {
-            max_frame_size: n,
+            max_flush_size: n,
             ..self
         }
     }
 
-    /// Close the connection after this time idle.
-    ///
-    /// Default: 60 seconds
     pub fn idle_timeout(self, d: Duration) -> Self {
         Self {
             idle_timeout: d,
@@ -153,9 +122,6 @@ impl Config {
         }
     }
 
-    /// Close the connection after this time writing block.
-    ///
-    /// Default: 10 seconds
     pub fn write_timeout(self, d: Duration) -> Self {
         Self {
             write_timeout: d,
@@ -163,14 +129,24 @@ impl Config {
         }
     }
 
+    /// Number of cores to use (thread-per-core model).
+    /// Default: 1
+    pub fn num_cores(self, n: usize) -> Self {
+        Self {
+            num_cores: n,
+            ..self
+        }
+    }
+
     /// Add the first service, and return a ConfigedServer.
-    pub fn add_service<S>(self, svc: S) -> ConfigedServer
+    pub fn add_service<S, F>(self, factory: F) -> ConfigedServer
     where
-        S: crate::PajamaxService + Send + Sync + 'static,
+        F: Fn() -> S + Send + Sync + 'static,
+        S: PajamaxService + 'static,
     {
         ConfigedServer {
             config: self,
-            services: vec![Arc::new(svc)],
+            services: vec![Box::new(move || Rc::new(factory()))],
         }
     }
 }

@@ -1,5 +1,5 @@
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use compio::BufResult;
 
 use crate::config::*;
 use crate::error::Error;
@@ -53,7 +53,6 @@ pub struct Frame<'a> {
 impl<'a> Frame<'a> {
     pub const HEAD_SIZE: usize = 9;
 
-    // return None if the input buf is not complete
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
         if buf.len() < Self::HEAD_SIZE {
             return None;
@@ -129,10 +128,14 @@ impl<'a> Frame<'a> {
     }
 }
 
-pub fn handshake(connection: &mut TcpStream, config: &Config) -> Result<(), Error> {
-    // parse the magic
-    let mut input = vec![0; 24];
-    let len = connection.read(&mut input)?;
+pub async fn handshake<S>(stream: &mut S, config: &Config) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite,
+{
+    // read the magic
+    let input = vec![0u8; 24];
+    let BufResult(res, input) = stream.read(input).await;
+    let len = res?;
     if len != 24 {
         return Err(Error::InvalidHttp2("too short handshake"));
     }
@@ -144,7 +147,8 @@ pub fn handshake(connection: &mut TcpStream, config: &Config) -> Result<(), Erro
     let mut output = Vec::new();
     build_settings(3, config.max_concurrent_streams as u32, &mut output);
     build_settings(5, config.max_frame_size as u32, &mut output);
-    connection.write_all(&output)?;
+    let BufResult(res, _) = stream.write_all(output).await;
+    res?;
 
     Ok(())
 }
@@ -220,8 +224,7 @@ pub fn build_response(
 
     trace!("build response stream={stream_id}, len={msg_len}");
 
-    // HEADERS
-    // TODO: check `TE: trailer` in request headers
+    // HEADERS (trailers)
     let start = output.len();
     output.resize(start + Frame::HEAD_SIZE, 0);
     hpack_encoder.encode_grpc_status_zero(output);
@@ -297,7 +300,7 @@ fn build_u16(n: u16, buf: &mut [u8]) {
 }
 
 // Used by `pajamax-build` crate.
-pub trait ReplyEncode: Send {
+pub trait ReplyEncode {
     fn encode(&self, output: &mut Vec<u8>) -> Result<(), prost::EncodeError>;
 }
 

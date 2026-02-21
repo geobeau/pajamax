@@ -1,143 +1,175 @@
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::Read;
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::rc::Rc;
+
+use compio::io::AsyncRead;
+use compio::net::{TcpListener, TcpStream};
+use compio::BufResult;
 
 use crate::config::Config;
-use crate::dispatch;
 use crate::error::Error;
 use crate::hpack_decoder::{Decoder, PathKind};
 use crate::http2::*;
 use crate::macros::*;
-use crate::response_end::ResponseEnd;
-use crate::{PajamaxService, Response};
+use crate::response_end;
+use crate::PajamaxService;
 
-pub fn serve_with_config<A>(
-    services: Vec<Arc<dyn PajamaxService + Send + Sync + 'static>>,
+/// Start the server with multiple compio runtimes (thread-per-core).
+pub fn serve_with_config(
+    service_factories: Vec<Box<dyn Fn() -> Rc<dyn PajamaxService> + Send + Sync>>,
     config: Config,
-    addr: A,
-) -> std::io::Result<()>
-where
-    A: ToSocketAddrs,
-{
-    let concurrent = Arc::new(AtomicUsize::new(0));
+    addr: String,
+) -> std::io::Result<()> {
+    let num_cores = config.num_cores;
+    let factories = std::sync::Arc::new(service_factories);
 
-    let listener = TcpListener::bind(addr)?;
-    for c in listener.incoming() {
+    if num_cores <= 1 {
+        let rt = compio::runtime::RuntimeBuilder::new()
+            .build()?;
+        let services: Vec<Rc<dyn PajamaxService>> =
+            factories.iter().map(|f| f()).collect();
+        rt.block_on(accept_loop(services, config, addr))?;
+    } else {
+        let mut handles = Vec::new();
+        for _ in 0..num_cores {
+            let addr = addr.clone();
+            let factories = factories.clone();
+            let handle = std::thread::Builder::new()
+                .name(String::from("pajamax-core"))
+                .spawn(move || {
+                    let rt = compio::runtime::RuntimeBuilder::new()
+                        .build()
+                        .expect("failed to build compio runtime");
+                    let services: Vec<Rc<dyn PajamaxService>> =
+                        factories.iter().map(|f| f()).collect();
+                    rt.block_on(accept_loop(services, config, addr))
+                        .expect("accept loop failed");
+                })
+                .unwrap();
+            handles.push(handle);
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn accept_loop(
+    services: Vec<Rc<dyn PajamaxService>>,
+    config: Config,
+    addr: String,
+) -> std::io::Result<()> {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_port(true)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.parse::<std::net::SocketAddr>().unwrap().into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
+    info!("listening on {}", addr);
+
+    let concurrent = Rc::new(std::cell::Cell::new(0usize));
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+
         // concurrent limit
-        if concurrent.load(Ordering::Relaxed) >= config.max_concurrent_connections {
+        if concurrent.get() >= config.max_concurrent_connections {
             error!("drop new connection for limit");
             continue;
         }
-        concurrent.fetch_add(1, Ordering::Relaxed);
+        concurrent.set(concurrent.get() + 1);
 
-        let c = c?;
-        info!("new connection from {}", c.local_addr().unwrap().ip());
+        info!("new connection from {:?}", peer);
 
-        // configure
-        c.set_read_timeout(Some(config.idle_timeout))?;
-        c.set_write_timeout(Some(config.write_timeout))?;
-
-        // new thread for each connection
-        let concurrent = concurrent.clone();
         let services = services.clone();
-        thread::Builder::new()
-            .name(String::from("pajamax-w"))
-            .spawn(move || {
-                match handle(services, c, config) {
-                    Ok(_) => info!("connection closed"),
-                    Err(err) => error!("connection fail: {:?}", err),
-                }
-                concurrent.fetch_sub(1, Ordering::Relaxed);
-            })
-            .unwrap();
+        let concurrent = concurrent.clone();
+        compio::runtime::spawn(async move {
+            match handle_connection(services, stream, config).await {
+                Ok(_) => info!("connection closed"),
+                Err(err) => error!("connection fail: {:?}", err),
+            }
+            concurrent.set(concurrent.get() - 1);
+        }).detach();
     }
-    unreachable!();
-}
-
-thread_local! {
-    static RESPONSE_END: RefCell<ResponseEnd> = panic!();
 }
 
 struct Stream {
     id: u32,
-    isvc: usize, // index of services
+    isvc: usize,
     req_disc: usize,
 }
 
-// response in local thread
-pub fn local_build_response<Reply>(stream_id: u32, response: Response<Reply>) -> Result<(), Error>
-where
-    Reply: prost::Message,
-{
-    RESPONSE_END.with_borrow_mut(|resp_end| Ok(resp_end.build(stream_id, response)?))
-}
-
-// handle each connection on a new thread
-pub fn handle(
-    services: Vec<Arc<dyn PajamaxService + Send + Sync + 'static>>,
-    mut c: TcpStream,
+async fn handle_connection(
+    services: Vec<Rc<dyn PajamaxService>>,
+    stream: TcpStream,
     config: Config,
 ) -> Result<(), Error> {
-    handshake(&mut c, &config)?;
+    // Handshake on full stream before splitting
+    let mut stream = stream;
+    crate::http2::handshake(&mut stream, &config).await?;
     trace!("handshake done");
 
-    // prepare some contexts
+    // Split into read and write halves
+    let (mut reader, writer) = stream.into_split();
 
-    // network input buffer
-    let mut input = Vec::new();
-    input.resize(config.max_frame_size, 0);
+    // Create response channel
+    let (resp_tx, resp_rx) = response_end::resp_channel();
 
-    // stream info in HEADER frame
-    let mut streams = VecDeque::new();
-
-    let mut hpack_decoder: Decoder = Decoder::new();
-
-    let mut route_cache = Vec::new();
-
-    // split into 2 ends.
-    // Read requests from `c` and write response into `c2`.
-    // Wrap `Arc` for backend-response thread in dispatch-mode.
-    let c2 = Arc::new(Mutex::new(c.try_clone()?));
-
-    // create backend response thread if any dispatch-mode service
-    if services.iter().any(|svc| svc.is_dispatch_mode()) {
-        dispatch::new_response_routine(c2.clone(), &config);
-    }
-
-    // in local-mode, this writes all responses;
-    // in dispatch-mode, this only writes dispatch-failure responses.
-    RESPONSE_END.set(ResponseEnd::new(c2, &config));
-
-    // read and parse input data
-    let mut last_end = 0;
-    while let Ok(len) = c.read(&mut input[last_end..]) {
-        trace!("receive data {len}");
-        if len == 0 {
-            // connection closed
-            return Ok(());
+    // Spawn writer task
+    compio::runtime::spawn(async move {
+        if let Err(e) = response_end::writer_task(writer, resp_rx, config).await {
+            error!("writer task error: {:?}", e);
         }
-        let end = last_end + len;
+    }).detach();
+
+    // Read and parse input data
+    let mut input: Vec<u8> = vec![0u8; config.max_frame_size];
+    let mut last_end: usize = 0;
+    let mut streams: VecDeque<Stream> = VecDeque::new();
+    let mut hpack_decoder = Decoder::new();
+    let mut route_cache: Vec<(usize, usize)> = Vec::new();
+
+    loop {
+        // Read data using ownership-based I/O
+        let read_buf = if last_end < input.len() {
+            // We have space in the buffer after last_end
+            let slice = input.split_off(last_end);
+            let remaining = input;
+            input = remaining;
+            slice
+        } else {
+            vec![0u8; config.max_frame_size]
+        };
+
+        let BufResult(res, returned_buf) = reader.read(read_buf).await;
+        let len = match res {
+            Ok(0) => return Ok(()), // connection closed
+            Ok(n) => n,
+            Err(e) => return Err(Error::IoFail(e)),
+        };
+
+        trace!("receive data {len}");
+
+        // Append read data to input buffer
+        input.extend_from_slice(&returned_buf[..len]);
+        let end = input.len();
 
         let mut data_len = 0;
-
         let mut pos = 0;
         while let Some(frame) = Frame::parse(&input[pos..end]) {
-            pos += Frame::HEAD_SIZE + frame.len; // for next loop
+            pos += Frame::HEAD_SIZE + frame.len;
 
             trace!(
                 "get frame {:?} {:?}, len:{}, stream_id:{}",
                 frame.kind,
                 frame.flags,
-                frame.stream_id,
-                frame.len
+                frame.len,
+                frame.stream_id
             );
 
             match frame.kind {
-                // call ::route() with cache
                 FrameKind::Headers => {
                     let headers_buf = frame.process_headers()?;
 
@@ -174,11 +206,9 @@ pub fn handle(
                     });
                 }
 
-                // call ::handle() to handle request
                 FrameKind::Data => {
                     let req_buf = frame.process_data()?;
 
-                    // unwrap grpc-level-protocal
                     if req_buf.len() == 0 {
                         continue;
                     }
@@ -187,7 +217,6 @@ pub fn handle(
                     }
                     let req_buf = &req_buf[5..];
 
-                    // check out request info
                     let Some(i) = streams.iter().position(|s| s.id == frame.stream_id) else {
                         return Err(Error::InvalidHttp2("DATA frame without HEADER"));
                     };
@@ -195,8 +224,15 @@ pub fn handle(
 
                     trace!("handle isvc:{isvc}, req_disc:{req_disc}");
 
-                    // handle request
-                    services[isvc].handle(req_disc, req_buf, id)?;
+                    let req_buf = req_buf.to_vec();
+                    let svc = services[isvc].clone();
+                    let resp_tx = resp_tx.clone();
+                    compio::runtime::spawn(async move {
+                        if let Err(e) = svc.handle(req_disc, &req_buf, id, &resp_tx).await {
+                            error!("handle error: {:?}", e);
+                        }
+                        let _ = resp_tx.send(response_end::RespJob::Flush);
+                    }).detach();
 
                     data_len += frame.len;
                 }
@@ -204,22 +240,28 @@ pub fn handle(
             }
         }
 
-        RESPONSE_END.with_borrow_mut(|resp_end| {
-            resp_end.window_update(data_len);
-            resp_end.flush()
-        })?;
+        // Send window update and flush
+        if data_len > 0 {
+            let _ = resp_tx.send(response_end::RespJob::WindowUpdate { len: data_len });
+        }
+        let _ = resp_tx.send(response_end::RespJob::Flush);
 
-        // for next loop
+        // Shift leftover data for next loop
         if pos == 0 {
             return Err(Error::InvalidHttp2("too long frame"));
         }
         if pos < end {
             trace!("left data {}", end - pos);
             input.copy_within(pos..end, 0);
+            input.truncate(end - pos);
             last_end = end - pos;
         } else {
+            input.clear();
             last_end = 0;
         }
+        // Ensure input has capacity for next read
+        if input.len() < config.max_frame_size {
+            input.resize(config.max_frame_size, 0);
+        }
     }
-    Ok(())
 }

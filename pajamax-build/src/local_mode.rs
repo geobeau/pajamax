@@ -7,14 +7,20 @@ pub fn generate(service: prost_build::Service, buf: &mut String) {
 
 // trait ${Service}
 //
-// This defines all gRPC methods.
+// This defines all gRPC methods. Now async.
 fn gen_trait_service(service: &prost_build::Service, buf: &mut String) {
-    writeln!(buf, "pub trait {} {{", service.name).unwrap();
+    writeln!(
+        buf,
+        "#[async_trait::async_trait(?Send)]
+        pub trait {} {{",
+        service.name
+    )
+    .unwrap();
 
     for m in service.methods.iter() {
         writeln!(
             buf,
-            "fn {}(&self, req: {}) -> pajamax::Response<{}>;",
+            "async fn {}(&self, req: {}) -> pajamax::Response<{}>;",
             m.name, m.input_type, m.output_type
         )
         .unwrap();
@@ -23,8 +29,6 @@ fn gen_trait_service(service: &prost_build::Service, buf: &mut String) {
 }
 
 // struct ${Service}Server
-//
-// Intermediary between pajamax::PajamaxService and application's server.
 fn gen_server(service: &prost_build::Service, buf: &mut String) {
     writeln!(
         buf,
@@ -40,10 +44,11 @@ fn gen_server(service: &prost_build::Service, buf: &mut String) {
     )
     .unwrap();
 
-    // impl pajamax::PajamaxService for ${Service}
+    // impl pajamax::PajamaxService for ${Service}Server
     writeln!(
         buf,
-        "impl<T> pajamax::PajamaxService for {}Server<T>
+        "#[async_trait::async_trait(?Send)]
+        impl<T> pajamax::PajamaxService for {}Server<T>
         where T: {}
         {{
             fn is_dispatch_mode(&self) -> bool {{ false }}
@@ -71,7 +76,7 @@ fn gen_service_route(service: &prost_build::Service, buf: &mut String) {
         writeln!(
             buf,
             "b\"/{}.{}/{}\" => Some({}),",
-            service.package, service.name, m.proto_name, i
+            service.package, service.proto_name, m.proto_name, i
         )
         .unwrap();
     }
@@ -82,11 +87,12 @@ fn gen_service_route(service: &prost_build::Service, buf: &mut String) {
 fn gen_service_handle(service: &prost_build::Service, buf: &mut String) {
     writeln!(
         buf,
-        "fn handle(
+        "async fn handle(
             &self,
             req_disc: usize,
             req_buf: &[u8],
             stream_id: u32,
+            resp_tx: &pajamax::RespTx,
         ) -> Result<(), pajamax::error::Error> {{
             use prost::Message;
             match req_disc {{"
@@ -98,8 +104,8 @@ fn gen_service_handle(service: &prost_build::Service, buf: &mut String) {
             buf,
             "{} => {{
                 let request = {}::decode(req_buf)?;
-                let response = self.0.{}(request);
-                pajamax::local_build_response(stream_id, response)
+                let response = self.0.{}(request).await;
+                pajamax::send_response(resp_tx, stream_id, response)
             }}",
             i, m.input_type, m.name
         )
