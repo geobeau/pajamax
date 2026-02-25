@@ -11,4 +11,4 @@ keywords = ["grpc", "protobuf", "compio", "io_uring", "async"]
 categories = ["network-programming"]
 
 [dependencies]
-prost-build = "0.13"
+prost-build = "0.14"

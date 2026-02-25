@@ -11,7 +11,7 @@ keywords = ["grpc", "protobuf", "compio", "io_uring", "async"]
 categories = ["network-programming"]
 
 [dependencies]
-prost = "0.13"
+prost = "0.14"
 compio = { version = "0.18", features = ["io", "net", "runtime"] }
 local-sync = "0.1"
 log = { version = "0.4", optional = true }
