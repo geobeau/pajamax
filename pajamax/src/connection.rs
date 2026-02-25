@@ -70,9 +70,10 @@ pub async fn accept_loop(
     info!("listening on {}", addr);
 
     let concurrent = Rc::new(std::cell::Cell::new(0usize));
-
+    let mut connections = 0;
     loop {
         let (stream, peer) = listener.accept().await?;
+        stream.set_nodelay(true)?;
 
         // concurrent limit
         if concurrent.get() >= config.max_concurrent_connections {
@@ -85,10 +86,12 @@ pub async fn accept_loop(
 
         let services = services.clone();
         let concurrent = concurrent.clone();
+        connections += 1;
+        println!("Handled {connections} connections");
         compio::runtime::spawn(async move {
             match handle_connection(services, stream, config).await {
-                Ok(_) => info!("connection closed"),
-                Err(err) => error!("connection fail: {:?}", err),
+                Ok(_) => println!("connection closed"),
+                Err(err) => println!("connection fail: {:?}", err),
             }
             concurrent.set(concurrent.get() - 1);
         }).detach();
@@ -99,6 +102,7 @@ struct Stream {
     id: u32,
     isvc: usize,
     req_disc: usize,
+    data: Vec<u8>,
 }
 
 async fn handle_connection(
@@ -203,6 +207,7 @@ async fn handle_connection(
                         id: frame.stream_id,
                         isvc,
                         req_disc,
+                        data: Vec::new(),
                     });
                 }
 
@@ -218,9 +223,11 @@ async fn handle_connection(
                     let req_buf = &req_buf[5..];
 
                     let Some(i) = streams.iter().position(|s| s.id == frame.stream_id) else {
-                        return Err(Error::InvalidHttp2("DATA frame without HEADER"));
+                        // Follow-up DATA frame for an already-dispatched stream; ignore
+                        data_len += frame.len;
+                        continue;
                     };
-                    let Stream { id, isvc, req_disc } = streams.remove(i).unwrap();
+                    let Stream { id, isvc, req_disc, .. } = streams.remove(i).unwrap();
 
                     trace!("handle isvc:{isvc}, req_disc:{req_disc}");
 
@@ -231,7 +238,6 @@ async fn handle_connection(
                         if let Err(e) = svc.handle(req_disc, &req_buf, id, &resp_tx).await {
                             error!("handle error: {:?}", e);
                         }
-                        let _ = resp_tx.send(response_end::RespJob::Flush);
                     }).detach();
 
                     data_len += frame.len;
@@ -240,11 +246,10 @@ async fn handle_connection(
             }
         }
 
-        // Send window update and flush
+        // Send window update
         if data_len > 0 {
             let _ = resp_tx.send(response_end::RespJob::WindowUpdate { len: data_len });
         }
-        let _ = resp_tx.send(response_end::RespJob::Flush);
 
         // Shift leftover data for next loop
         if pos == 0 {

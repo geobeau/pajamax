@@ -164,7 +164,7 @@ impl HeadFlags {
     fn from(flag: u8) -> Self {
         Self(flag)
     }
-    fn is_end_stream(self) -> bool {
+    pub fn is_end_stream(self) -> bool {
         self.0 & Self::END_STREAM != 0
     }
     fn is_end_headers(self) -> bool {
