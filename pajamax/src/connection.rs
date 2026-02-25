@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use compio::io::AsyncRead;
 use compio::net::{TcpListener, TcpStream};
@@ -13,46 +14,76 @@ use crate::macros::*;
 use crate::response_end;
 use crate::PajamaxService;
 
-/// Start the server with multiple compio runtimes (thread-per-core).
-pub fn serve_with_config(
-    service_factories: Vec<Box<dyn Fn() -> Rc<dyn PajamaxService> + Send + Sync>>,
-    config: Config,
-    addr: String,
-) -> std::io::Result<()> {
-    let num_cores = config.num_cores;
-    let factories = std::sync::Arc::new(service_factories);
+/// Balances accepted connections across worker loops using round-robin.
+pub struct ConnectionBalancer {
+    workers: std::sync::Mutex<Vec<flume::Sender<std::net::TcpStream>>>,
+    counter: AtomicUsize,
+}
 
-    if num_cores <= 1 {
-        let rt = compio::runtime::RuntimeBuilder::new()
-            .build()?;
-        let services: Vec<Rc<dyn PajamaxService>> =
-            factories.iter().map(|f| f()).collect();
-        rt.block_on(accept_loop(services, config, addr))?;
-    } else {
-        let mut handles = Vec::new();
-        for _ in 0..num_cores {
-            let addr = addr.clone();
-            let factories = factories.clone();
-            let handle = std::thread::Builder::new()
-                .name(String::from("pajamax-core"))
-                .spawn(move || {
-                    let rt = compio::runtime::RuntimeBuilder::new()
-                        .build()
-                        .expect("failed to build compio runtime");
-                    let services: Vec<Rc<dyn PajamaxService>> =
-                        factories.iter().map(|f| f()).collect();
-                    rt.block_on(accept_loop(services, config, addr))
-                        .expect("accept loop failed");
-                })
-                .unwrap();
-            handles.push(handle);
-        }
-        for h in handles {
-            h.join().expect("worker thread panicked");
+impl ConnectionBalancer {
+    pub fn new() -> Self {
+        Self {
+            workers: std::sync::Mutex::new(Vec::new()),
+            counter: AtomicUsize::new(0),
         }
     }
 
-    Ok(())
+    /// Register a new worker and return its async receiver channel.
+    pub fn register(&self) -> flume::Receiver<std::net::TcpStream> {
+        let (tx, rx) = flume::unbounded();
+        self.workers.lock().unwrap().push(tx);
+        rx
+    }
+
+    /// Dispatch a connection to the next worker (round-robin).
+    pub fn dispatch(&self, stream: std::net::TcpStream) {
+        let workers = self.workers.lock().unwrap();
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % workers.len();
+        let _ = workers[idx].send(stream);
+    }
+}
+
+/// Server configuration. Created once, shared across all worker threads.
+///
+/// Use [`serve`] to start accepting and handling connections with this
+/// configuration. The [`ConnectionBalancer`] inside distributes accepted
+/// connections across all registered runtimes via round-robin.
+#[derive(Clone)]
+pub struct Server {
+    config: Config,
+    addr: String,
+    factories: std::sync::Arc<Vec<Box<dyn Fn() -> Rc<dyn PajamaxService> + Send + Sync>>>,
+    balancer: std::sync::Arc<ConnectionBalancer>,
+}
+
+impl Server {
+    pub fn new(
+        service_factories: Vec<Box<dyn Fn() -> Rc<dyn PajamaxService> + Send + Sync>>,
+        config: Config,
+        addr: String,
+    ) -> Self {
+        Self {
+            config,
+            addr,
+            factories: std::sync::Arc::new(service_factories),
+            balancer: std::sync::Arc::new(ConnectionBalancer::new()),
+        }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+}
+
+/// Start accepting and handling connections on the current compio runtime.
+///
+/// Must be called from within a compio runtime. Each call registers with the
+/// shared balancer so connections are distributed across all runtimes.
+pub async fn serve(server: Server) -> std::io::Result<()> {
+    let services: Vec<Rc<dyn PajamaxService>> =
+        server.factories.iter().map(|f| f()).collect();
+    let rx = server.balancer.register();
+    balanced_loop(services, server.config, server.addr.clone(), server.balancer.clone(), rx).await
 }
 
 pub async fn accept_loop(
@@ -96,6 +127,80 @@ pub async fn accept_loop(
             concurrent.set(concurrent.get() - 1);
         }).detach();
     }
+}
+
+/// Combined accept + worker loop for balanced mode.
+/// Each thread accepts connections via SO_REUSEPORT and dispatches them
+/// round-robin through the balancer. A separate worker loop receives
+/// connections from the balancer channel and handles them.
+async fn balanced_loop(
+    services: Vec<Rc<dyn PajamaxService>>,
+    config: Config,
+    addr: String,
+    balancer: std::sync::Arc<ConnectionBalancer>,
+    rx: flume::Receiver<std::net::TcpStream>,
+) -> std::io::Result<()> {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_port(true)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.parse::<std::net::SocketAddr>().unwrap().into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
+    info!("listening on {}", addr);
+
+    // Accept task: accepts connections and dispatches to balancer round-robin
+    compio::runtime::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _peer)) => {
+                    let owned_fd = match std::os::fd::AsFd::as_fd(&stream).try_clone_to_owned() {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            error!("failed to dup accepted fd: {:?}", e);
+                            continue;
+                        }
+                    };
+                    drop(stream);
+                    let std_stream = std::net::TcpStream::from(owned_fd);
+                    balancer.dispatch(std_stream);
+                }
+                Err(e) => {
+                    error!("accept error: {:?}", e);
+                }
+            }
+        }
+    }).detach();
+
+    // Worker loop: receive connections from balancer channel via flume async
+    let concurrent = Rc::new(std::cell::Cell::new(0usize));
+    let mut connections = 0;
+    while let Ok(std_stream) = rx.recv_async().await {
+        std_stream.set_nodelay(true).ok();
+
+        if concurrent.get() >= config.max_concurrent_connections {
+            error!("drop new connection for limit");
+            continue;
+        }
+        concurrent.set(concurrent.get() + 1);
+
+        let stream = TcpStream::from_std(std_stream)?;
+        info!("new connection (balanced)");
+
+        let services = services.clone();
+        let concurrent = concurrent.clone();
+        connections += 1;
+        println!("Handled {connections} connections");
+        compio::runtime::spawn(async move {
+            match handle_connection(services, stream, config).await {
+                Ok(_) => println!("connection closed"),
+                Err(err) => println!("connection fail: {:?}", err),
+            }
+            concurrent.set(concurrent.get() - 1);
+        }).detach();
+    }
+
+    Ok(())
 }
 
 struct Stream {

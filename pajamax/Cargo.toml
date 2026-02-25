@@ -16,7 +16,8 @@ compio = { version = "0.18", features = ["io", "net", "runtime"] }
 local-sync = "0.1"
 log = { version = "0.4", optional = true }
 async-trait = "0.1"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
+flume = "0.11"
 
 [features]
 default = ["log"]

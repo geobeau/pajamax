@@ -33,21 +33,53 @@ impl ConfigedServer {
         self
     }
 
+    /// Build a [`Server`](crate::connection::Server) from this configuration.
+    ///
+    /// The returned `Server` is `Clone + Send + Sync` and should be shared
+    /// across all worker threads. Call [`serve`](crate::connection::serve)
+    /// inside each compio runtime to start accepting connections.
+    pub fn into_server(self, addr: &str) -> crate::connection::Server {
+        crate::connection::Server::new(self.services, self.config, addr.to_string())
+    }
+
     /// Start a listener on the current compio runtime.
     ///
     /// This is an async function that must be called from within a compio runtime.
     /// The caller is responsible for creating compio runtimes and threads.
     pub async fn listen(self, addr: &str) -> std::io::Result<()> {
-        let services: Vec<Rc<dyn crate::PajamaxService>> =
-            self.services.iter().map(|f| f()).collect();
-        crate::connection::accept_loop(services, self.config, addr.to_string()).await
+        crate::connection::serve(self.into_server(addr)).await
     }
 
     /// Start the server with built-in thread-per-core compio runtimes.
     ///
     /// Convenience method that creates compio runtimes and blocks the calling thread.
     pub fn serve(self, addr: &str) -> std::io::Result<()> {
-        crate::connection::serve_with_config(self.services, self.config, addr.to_string())
+        let server = self.into_server(addr);
+        let num_cores = server.config().num_cores;
+        if num_cores <= 1 {
+            let rt = compio::runtime::RuntimeBuilder::new().build()?;
+            rt.block_on(crate::connection::serve(server))?;
+        } else {
+            let mut handles = Vec::new();
+            for _ in 0..num_cores {
+                let server = server.clone();
+                let handle = std::thread::Builder::new()
+                    .name(String::from("pajamax-core"))
+                    .spawn(move || {
+                        let rt = compio::runtime::RuntimeBuilder::new()
+                            .build()
+                            .expect("failed to build compio runtime");
+                        rt.block_on(crate::connection::serve(server))
+                            .expect("worker loop failed");
+                    })
+                    .unwrap();
+                handles.push(handle);
+            }
+            for h in handles {
+                h.join().expect("worker thread panicked");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -81,61 +113,37 @@ impl Config {
     }
 
     pub fn max_concurrent_connections(self, n: usize) -> Self {
-        Self {
-            max_concurrent_connections: n,
-            ..self
-        }
+        Self { max_concurrent_connections: n, ..self }
     }
 
     pub fn max_concurrent_streams(self, n: usize) -> Self {
-        Self {
-            max_concurrent_streams: n,
-            ..self
-        }
+        Self { max_concurrent_streams: n, ..self }
     }
 
     pub fn max_frame_size(self, n: usize) -> Self {
-        Self {
-            max_frame_size: n,
-            ..self
-        }
+        Self { max_frame_size: n, ..self }
     }
 
     pub fn max_flush_requests(self, n: usize) -> Self {
-        Self {
-            max_flush_requests: n,
-            ..self
-        }
+        Self { max_flush_requests: n, ..self }
     }
 
     pub fn max_flush_size(self, n: usize) -> Self {
-        Self {
-            max_flush_size: n,
-            ..self
-        }
+        Self { max_flush_size: n, ..self }
     }
 
     pub fn idle_timeout(self, d: Duration) -> Self {
-        Self {
-            idle_timeout: d,
-            ..self
-        }
+        Self { idle_timeout: d, ..self }
     }
 
     pub fn write_timeout(self, d: Duration) -> Self {
-        Self {
-            write_timeout: d,
-            ..self
-        }
+        Self { write_timeout: d, ..self }
     }
 
     /// Number of cores to use (thread-per-core model).
     /// Default: 1
     pub fn num_cores(self, n: usize) -> Self {
-        Self {
-            num_cores: n,
-            ..self
-        }
+        Self { num_cores: n, ..self }
     }
 
     /// Add the first service, and return a ConfigedServer.

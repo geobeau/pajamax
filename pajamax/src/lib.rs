@@ -61,6 +61,7 @@ pub mod response_end;
 
 pub mod status;
 pub use config::{Config, ConfigedServer};
+pub use connection::{Server, serve};
 
 #[doc(hidden)]
 pub use response_end::{send_response, RespTx};
