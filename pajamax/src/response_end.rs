@@ -10,19 +10,19 @@ use crate::Response;
 
 /// A response job sent from handlers to the writer task.
 pub enum RespJob {
-    /// Successful reply: encode the message into the output buffer.
     Reply {
         stream_id: u32,
         encode_fn: Box<dyn FnOnce(&mut Vec<u8>)>,
     },
-    /// Error status response.
     Status {
         stream_id: u32,
         status: crate::status::Status,
     },
-    /// Window update after consuming DATA frames.
     WindowUpdate {
         len: usize,
+    },
+    Write {
+        buf: Vec<u8>,
     },
 }
 
@@ -66,6 +66,9 @@ pub async fn writer_task(
                 if len > 0 {
                     http2::build_window_update(len, &mut output);
                 }
+            }
+            RespJob::Write { buf } => {
+                output.extend(buf);
             }
         }
 

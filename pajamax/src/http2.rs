@@ -160,6 +160,7 @@ impl HeadFlags {
     const END_HEADERS: u8 = 0x4;
     const PADDED: u8 = 0x8;
     const PRIORITY: u8 = 0x20;
+    const ACK: u8 = 0x1;
 
     fn from(flag: u8) -> Self {
         Self(flag)
@@ -175,6 +176,9 @@ impl HeadFlags {
     }
     fn is_priority(self) -> bool {
         self.0 & Self::PRIORITY != 0
+    }
+    pub fn is_ack(self) -> bool {
+        self.0 & Self::ACK != 0
     }
 }
 
@@ -273,6 +277,13 @@ pub fn build_window_update(len: usize, output: &mut Vec<u8>) {
     Frame::build_head(4, FrameKind::WindowUpdate, 0, 0, &mut output[start..]);
 
     build_u32(len as u32, &mut output[start + Frame::HEAD_SIZE..]);
+}
+
+pub fn build_settings_ack(output: &mut Vec<u8>) {
+    let start = output.len();
+    output.resize(start + Frame::HEAD_SIZE, 0);
+
+    Frame::build_head(0, FrameKind::Settings, HeadFlags::ACK, 0, &mut output[start..]);
 }
 
 fn build_settings(ident: u16, value: u32, output: &mut Vec<u8>) {

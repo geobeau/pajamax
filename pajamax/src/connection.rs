@@ -316,6 +316,13 @@ async fn handle_connection(
                     });
                 }
 
+                FrameKind::Settings => {
+                    if !frame.flags.is_ack() {
+                        let mut output = Vec::new();
+                        crate::http2::build_settings_ack(&mut output);
+                        let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
+                    }
+                }
                 FrameKind::Data => {
                     let req_buf = frame.process_data()?;
 
