@@ -431,6 +431,26 @@ async fn handle_connection(
 
                 FrameKind::Settings => {
                     if !frame.flags.is_ack() {
+                        // Parse client SETTINGS parameters
+                        let mut offset = 0;
+                        while offset + 6 <= frame.len {
+                            let ident = u16::from_be_bytes([frame.payload[offset], frame.payload[offset + 1]]);
+                            let value = u32::from_be_bytes([
+                                frame.payload[offset + 2], frame.payload[offset + 3],
+                                frame.payload[offset + 4], frame.payload[offset + 5],
+                            ]);
+                            match ident {
+                                1 => trace!("client SETTINGS_HEADER_TABLE_SIZE: {value}"),
+                                2 => trace!("client SETTINGS_ENABLE_PUSH: {value}"),
+                                3 => trace!("client SETTINGS_MAX_CONCURRENT_STREAMS: {value}"),
+                                4 => trace!("client SETTINGS_INITIAL_WINDOW_SIZE: {value}"),
+                                5 => trace!("client SETTINGS_MAX_FRAME_SIZE: {value}"),
+                                6 => trace!("client SETTINGS_MAX_HEADER_LIST_SIZE: {value}"),
+                                _ => trace!("client SETTINGS unknown ident:{ident} value:{value}"),
+                            }
+                            offset += 6;
+                        }
+
                         let mut output = Vec::new();
                         crate::http2::build_settings_ack(&mut output);
                         let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
