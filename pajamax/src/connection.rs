@@ -300,7 +300,7 @@ async fn handle_connection(
                         continue;
                     }
 
-                    let _end_stream = frame.flags.is_end_stream();
+                    let end_stream = frame.flags.is_end_stream();
                     let (isvc, req_disc) = match hpack_decoder.find_path(headers_buf)? {
                         PathKind::Cached(cached) => {
                             trace!("route cache hit: {cached}");
@@ -327,12 +327,24 @@ async fn handle_connection(
                         }
                     };
 
-                    streams.push_back(Stream {
-                        id: frame.stream_id,
-                        isvc,
-                        req_disc,
-                        data: Vec::new(),
-                    });
+                    if end_stream {
+                        let id = frame.stream_id;
+                        let svc = services[isvc].clone();
+                        let resp_tx = resp_tx.clone();
+                        trace!("handle (no body) isvc:{isvc}, req_disc:{req_disc}");
+                        compio::runtime::spawn(async move {
+                            if let Err(e) = svc.handle(req_disc, &[], id, &resp_tx).await {
+                                error!("handle error: {:?}", e);
+                            }
+                        }).detach();
+                    } else {
+                        streams.push_back(Stream {
+                            id: frame.stream_id,
+                            isvc,
+                            req_disc,
+                            data: Vec::new(),
+                        });
+                    }
                 }
                 FrameKind::Continuation => {
                     let Some((cont_stream_id, end_stream, ref mut buf)) = continuation_buf else {
@@ -346,7 +358,7 @@ async fn handle_connection(
                     }
 
                     let stream_id = cont_stream_id;
-                    let _end_stream = end_stream;
+                    let end_stream = end_stream;
                     let headers_buf = std::mem::take(buf);
                     continuation_buf = None;
 
@@ -376,12 +388,23 @@ async fn handle_connection(
                         }
                     };
 
-                    streams.push_back(Stream {
-                        id: stream_id,
-                        isvc,
-                        req_disc,
-                        data: Vec::new(),
-                    });
+                    if end_stream {
+                        let svc = services[isvc].clone();
+                        let resp_tx = resp_tx.clone();
+                        trace!("handle (no body) isvc:{isvc}, req_disc:{req_disc}");
+                        compio::runtime::spawn(async move {
+                            if let Err(e) = svc.handle(req_disc, &[], stream_id, &resp_tx).await {
+                                error!("handle error: {:?}", e);
+                            }
+                        }).detach();
+                    } else {
+                        streams.push_back(Stream {
+                            id: stream_id,
+                            isvc,
+                            req_disc,
+                            data: Vec::new(),
+                        });
+                    }
                 }
 
                 FrameKind::Settings => {
