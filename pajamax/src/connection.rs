@@ -446,25 +446,28 @@ async fn handle_connection(
                 FrameKind::Data => {
                     let req_buf = frame.process_data()?;
 
-                    if req_buf.len() == 0 {
-                        continue;
-                    }
-                    if req_buf.len() < 5 {
-                        return Err(Error::InvalidHttp2("DATA frame too short for grpc"));
-                    }
-                    let req_buf = &req_buf[5..];
+                    data_len += frame.len;
+                    stream_data_lens.push((frame.stream_id, frame.len));
 
                     let Some(i) = streams.iter().position(|s| s.id == frame.stream_id) else {
-                        // Follow-up DATA frame for an already-dispatched stream; ignore
-                        data_len += frame.len;
-                        stream_data_lens.push((frame.stream_id, frame.len));
                         continue;
                     };
-                    let Stream { id, isvc, req_disc, .. } = streams.remove(i).unwrap();
+
+                    streams[i].data.extend_from_slice(req_buf);
+
+                    if !frame.flags.is_end_stream() {
+                        continue;
+                    }
+
+                    let Stream { id, isvc, req_disc, data, .. } = streams.remove(i).unwrap();
+
+                    if data.len() < 5 {
+                        return Err(Error::InvalidHttp2("DATA too short for grpc"));
+                    }
+                    let req_buf = data[5..].to_vec();
 
                     trace!("handle isvc:{isvc}, req_disc:{req_disc}");
 
-                    let req_buf = req_buf.to_vec();
                     let svc = services[isvc].clone();
                     let resp_tx = resp_tx.clone();
                     compio::runtime::spawn(async move {
@@ -472,9 +475,6 @@ async fn handle_connection(
                             error!("handle error: {:?}", e);
                         }
                     }).detach();
-
-                    data_len += frame.len;
-                    stream_data_lens.push((frame.stream_id, frame.len));
                 }
                 FrameKind::WindowUpdate => {
                     if frame.len != 4 {
