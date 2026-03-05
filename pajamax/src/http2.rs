@@ -84,12 +84,6 @@ impl<'a> Frame<'a> {
     }
 
     pub fn process_headers(&self) -> Result<&[u8], Error> {
-        if !self.flags.is_end_headers() {
-            return Err(Error::InvalidHttp2("multiple HEADERS frames"));
-        }
-        if self.flags.is_end_stream() {
-            return Err(Error::InvalidHttp2("HEADERS frame with no DATA"));
-        }
         let headers = self.skip_padded(self.payload)?;
         let headers = self.skip_priority(headers)?;
 
@@ -176,7 +170,7 @@ impl HeadFlags {
     pub fn is_end_stream(self) -> bool {
         self.0 & Self::END_STREAM != 0
     }
-    fn is_end_headers(self) -> bool {
+    pub fn is_end_headers(self) -> bool {
         self.0 & Self::END_HEADERS != 0
     }
     fn is_padded(self) -> bool {

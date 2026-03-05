@@ -239,6 +239,7 @@ async fn handle_connection(
     let mut streams: VecDeque<Stream> = VecDeque::new();
     let mut hpack_decoder = Decoder::new();
     let mut route_cache: Vec<(usize, usize)> = Vec::new();
+    let mut continuation_buf: Option<(u32, bool, Vec<u8>)> = None; // (stream_id, end_stream, accumulated headers)
 
     loop {
         // Read data using ownership-based I/O
@@ -279,10 +280,27 @@ async fn handle_connection(
                 frame.stream_id
             );
 
+            // When expecting CONTINUATION, reject any other frame type on the same connection
+            if let Some((cont_stream_id, _, _)) = &continuation_buf {
+                if frame.kind != FrameKind::Continuation {
+                    return Err(Error::InvalidHttp2("expected CONTINUATION frame"));
+                }
+                if frame.stream_id != *cont_stream_id {
+                    return Err(Error::InvalidHttp2("CONTINUATION stream ID mismatch"));
+                }
+            }
+
             match frame.kind {
                 FrameKind::Headers => {
                     let headers_buf = frame.process_headers()?;
 
+                    if !frame.flags.is_end_headers() {
+                        let buf = Vec::from(headers_buf);
+                        continuation_buf = Some((frame.stream_id, frame.flags.is_end_stream(), buf));
+                        continue;
+                    }
+
+                    let _end_stream = frame.flags.is_end_stream();
                     let (isvc, req_disc) = match hpack_decoder.find_path(headers_buf)? {
                         PathKind::Cached(cached) => {
                             trace!("route cache hit: {cached}");
@@ -311,6 +329,55 @@ async fn handle_connection(
 
                     streams.push_back(Stream {
                         id: frame.stream_id,
+                        isvc,
+                        req_disc,
+                        data: Vec::new(),
+                    });
+                }
+                FrameKind::Continuation => {
+                    let Some((cont_stream_id, end_stream, ref mut buf)) = continuation_buf else {
+                        return Err(Error::InvalidHttp2("unexpected CONTINUATION frame"));
+                    };
+
+                    buf.extend_from_slice(frame.payload);
+
+                    if !frame.flags.is_end_headers() {
+                        continue;
+                    }
+
+                    let stream_id = cont_stream_id;
+                    let _end_stream = end_stream;
+                    let headers_buf = std::mem::take(buf);
+                    continuation_buf = None;
+
+                    let (isvc, req_disc) = match hpack_decoder.find_path(&headers_buf)? {
+                        PathKind::Cached(cached) => {
+                            trace!("route cache hit: {cached}");
+                            route_cache[cached]
+                        }
+                        PathKind::Plain(path) => {
+                            let len0 = route_cache.len();
+                            for (i, svc) in services.iter().enumerate() {
+                                if let Some(req_disc) = svc.route(&path) {
+                                    route_cache.push((i, req_disc));
+                                    break;
+                                }
+                            }
+                            if route_cache.len() == len0 {
+                                return Err(Error::UnknownMethod(
+                                    String::from_utf8_lossy(&path).into(),
+                                ));
+                            }
+                            trace!(
+                                "route cache new ({len0}): {}",
+                                String::from_utf8_lossy(&path)
+                            );
+                            route_cache[len0]
+                        }
+                    };
+
+                    streams.push_back(Stream {
+                        id: stream_id,
                         isvc,
                         req_disc,
                         data: Vec::new(),
