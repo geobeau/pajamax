@@ -291,6 +291,12 @@ async fn handle_connection(
             }
 
             match frame.kind {
+                FrameKind::Data | FrameKind::Headers if frame.stream_id == 0 => {
+                    return Err(Error::InvalidHttp2("DATA/HEADERS must not be on stream 0"));
+                }
+                FrameKind::Settings | FrameKind::Ping | FrameKind::GoAway if frame.stream_id != 0 => {
+                    return Err(Error::InvalidHttp2("SETTINGS/PING/GOAWAY must be on stream 0"));
+                }
                 FrameKind::Headers => {
                     let headers_buf = frame.process_headers()?;
 
