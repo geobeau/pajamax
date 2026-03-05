@@ -240,6 +240,7 @@ async fn handle_connection(
     let mut hpack_decoder = Decoder::new();
     let mut route_cache: Vec<(usize, usize)> = Vec::new();
     let mut continuation_buf: Option<(u32, bool, Vec<u8>)> = None; // (stream_id, end_stream, accumulated headers)
+    let mut last_client_stream_id: u32 = 0;
 
     loop {
         // Read data using ownership-based I/O
@@ -298,6 +299,14 @@ async fn handle_connection(
                     return Err(Error::InvalidHttp2("SETTINGS/PING/GOAWAY must be on stream 0"));
                 }
                 FrameKind::Headers => {
+                    if frame.stream_id % 2 == 0 {
+                        return Err(Error::InvalidHttp2("client stream ID must be odd"));
+                    }
+                    if frame.stream_id <= last_client_stream_id {
+                        return Err(Error::InvalidHttp2("client stream ID must be monotonically increasing"));
+                    }
+                    last_client_stream_id = frame.stream_id;
+
                     let headers_buf = frame.process_headers()?;
 
                     if !frame.flags.is_end_headers() {
