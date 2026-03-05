@@ -331,6 +331,15 @@ async fn handle_connection(
                         let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
                     }
                 }
+                FrameKind::Reset => {
+                    if frame.len != 4 {
+                        return Err(Error::InvalidHttp2("RST_STREAM payload must be 4 bytes"));
+                    }
+                    if let Some(i) = streams.iter().position(|s| s.id == frame.stream_id) {
+                        streams.remove(i);
+                    }
+                    trace!("RST_STREAM stream_id:{}", frame.stream_id);
+                }
                 FrameKind::Data => {
                     let req_buf = frame.process_data()?;
 
