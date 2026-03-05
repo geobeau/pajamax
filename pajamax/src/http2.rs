@@ -162,6 +162,8 @@ impl HeadFlags {
     const PRIORITY: u8 = 0x20;
     const ACK: u8 = 0x1;
 
+    pub const PING_ACK: u8 = 0x1;
+
     fn from(flag: u8) -> Self {
         Self(flag)
     }
@@ -179,6 +181,9 @@ impl HeadFlags {
     }
     pub fn is_ack(self) -> bool {
         self.0 & Self::ACK != 0
+    }
+    pub fn is_ping_ack(self) -> bool {
+        self.0 & Self::PING_ACK != 0
     }
 }
 
@@ -284,6 +289,15 @@ pub fn build_settings_ack(output: &mut Vec<u8>) {
     output.resize(start + Frame::HEAD_SIZE, 0);
 
     Frame::build_head(0, FrameKind::Settings, HeadFlags::ACK, 0, &mut output[start..]);
+}
+
+pub fn build_ping_ack(payload: &[u8], output: &mut Vec<u8>) {
+    let start = output.len();
+    output.resize(start + Frame::HEAD_SIZE + 8, 0);
+
+    Frame::build_head(8, FrameKind::Ping, HeadFlags::PING_ACK, 0, &mut output[start..]);
+
+    output[start + Frame::HEAD_SIZE..start + Frame::HEAD_SIZE + 8].copy_from_slice(payload);
 }
 
 fn build_settings(ident: u16, value: u32, output: &mut Vec<u8>) {

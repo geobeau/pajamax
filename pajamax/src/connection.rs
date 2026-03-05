@@ -323,6 +323,13 @@ async fn handle_connection(
                         let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
                     }
                 }
+                FrameKind::Ping => {
+                    if !frame.flags.is_ping_ack() {
+                        let mut output = Vec::new();
+                        crate::http2::build_ping_ack(frame.payload, &mut output);
+                        let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
+                    }
+                }
                 FrameKind::Data => {
                     let req_buf = frame.process_data()?;
 
