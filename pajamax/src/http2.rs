@@ -132,14 +132,20 @@ pub async fn handshake<S>(stream: &mut S, config: &Config) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite,
 {
-    // read the magic
-    let input = vec![0u8; 24];
-    let BufResult(res, input) = stream.read(input).await;
-    let len = res?;
-    if len != 24 {
-        return Err(Error::InvalidHttp2("too short handshake"));
+    // read the magic, looping for partial reads
+    let mut input = vec![0u8; 24];
+    let mut total = 0;
+    while total < 24 {
+        let buf = input.split_off(total);
+        let BufResult(res, returned) = stream.read(buf).await;
+        let len = res?;
+        if len == 0 {
+            return Err(Error::InvalidHttp2("connection closed during handshake"));
+        }
+        input.extend_from_slice(&returned[..len]);
+        total += len;
     }
-    if input != *b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+    if input != b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
         return Err(Error::InvalidHttp2("invalid handshake message"));
     }
 
