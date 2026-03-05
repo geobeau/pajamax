@@ -307,6 +307,13 @@ async fn handle_connection(
                     }
                     last_client_stream_id = frame.stream_id;
 
+                    if streams.len() >= config.max_concurrent_streams {
+                        let mut output = Vec::new();
+                        crate::http2::build_rst_stream(frame.stream_id, 7, &mut output); // REFUSED_STREAM
+                        let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
+                        continue;
+                    }
+
                     let headers_buf = frame.process_headers()?;
 
                     if !frame.flags.is_end_headers() {

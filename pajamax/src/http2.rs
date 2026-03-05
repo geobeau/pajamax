@@ -284,6 +284,15 @@ pub fn build_window_update(len: usize, stream_id: u32, output: &mut Vec<u8>) {
     build_u32(len as u32, &mut output[start + Frame::HEAD_SIZE..]);
 }
 
+pub fn build_rst_stream(stream_id: u32, error_code: u32, output: &mut Vec<u8>) {
+    let start = output.len();
+    output.resize(start + Frame::HEAD_SIZE + 4, 0);
+
+    Frame::build_head(4, FrameKind::Reset, 0, stream_id, &mut output[start..]);
+
+    build_u32(error_code, &mut output[start + Frame::HEAD_SIZE..]);
+}
+
 pub fn build_settings_ack(output: &mut Vec<u8>) {
     let start = output.len();
     output.resize(start + Frame::HEAD_SIZE, 0);
