@@ -68,7 +68,7 @@ impl<'a> Frame<'a> {
             len,
             kind: FrameKind::from(buf[3]),
             flags: HeadFlags::from(buf[4]),
-            stream_id: parse_u32(&buf[5..]),
+            stream_id: parse_u32(&buf[5..]) & 0x7FFF_FFFF,
             payload: &buf[Frame::HEAD_SIZE..Frame::HEAD_SIZE + len],
         })
     }
