@@ -386,6 +386,18 @@ async fn handle_connection(
                     data_len += frame.len;
                     stream_data_lens.push((frame.stream_id, frame.len));
                 }
+                FrameKind::WindowUpdate => {
+                    if frame.len != 4 {
+                        return Err(Error::InvalidHttp2("WINDOW_UPDATE payload must be 4 bytes"));
+                    }
+                    let increment = u32::from_be_bytes([
+                        frame.payload[0] & 0x7f, frame.payload[1], frame.payload[2], frame.payload[3],
+                    ]);
+                    if increment == 0 {
+                        return Err(Error::InvalidHttp2("WINDOW_UPDATE increment must be non-zero"));
+                    }
+                    trace!("WINDOW_UPDATE stream_id:{} increment:{increment}", frame.stream_id);
+                }
                 _ => (),
             }
         }
