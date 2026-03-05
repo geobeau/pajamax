@@ -331,6 +331,19 @@ async fn handle_connection(
                         let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
                     }
                 }
+                FrameKind::GoAway => {
+                    if frame.len < 8 {
+                        return Err(Error::InvalidHttp2("GOAWAY payload must be at least 8 bytes"));
+                    }
+                    let last_stream_id = u32::from_be_bytes([
+                        frame.payload[0] & 0x7f, frame.payload[1], frame.payload[2], frame.payload[3],
+                    ]);
+                    let error_code = u32::from_be_bytes([
+                        frame.payload[4], frame.payload[5], frame.payload[6], frame.payload[7],
+                    ]);
+                    trace!("GOAWAY last_stream_id:{last_stream_id} error_code:{error_code}");
+                    return Ok(());
+                }
                 FrameKind::Reset => {
                     if frame.len != 4 {
                         return Err(Error::InvalidHttp2("RST_STREAM payload must be 4 bytes"));
