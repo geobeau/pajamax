@@ -266,6 +266,7 @@ async fn handle_connection(
         let end = input.len();
 
         let mut data_len = 0;
+        let mut stream_data_lens: Vec<(u32, usize)> = Vec::new();
         let mut pos = 0;
         while let Some(frame) = Frame::parse(&input[pos..end]) {
             pos += Frame::HEAD_SIZE + frame.len;
@@ -344,6 +345,7 @@ async fn handle_connection(
                     let Some(i) = streams.iter().position(|s| s.id == frame.stream_id) else {
                         // Follow-up DATA frame for an already-dispatched stream; ignore
                         data_len += frame.len;
+                        stream_data_lens.push((frame.stream_id, frame.len));
                         continue;
                     };
                     let Stream { id, isvc, req_disc, .. } = streams.remove(i).unwrap();
@@ -360,6 +362,7 @@ async fn handle_connection(
                     }).detach();
 
                     data_len += frame.len;
+                    stream_data_lens.push((frame.stream_id, frame.len));
                 }
                 _ => (),
             }
@@ -367,7 +370,7 @@ async fn handle_connection(
 
         // Send window update
         if data_len > 0 {
-            let _ = resp_tx.send(response_end::RespJob::WindowUpdate { len: data_len });
+            let _ = resp_tx.send(response_end::RespJob::WindowUpdate { len: data_len, stream_data_lens });
         }
 
         // Shift leftover data for next loop

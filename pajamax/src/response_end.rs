@@ -20,6 +20,7 @@ pub enum RespJob {
     },
     WindowUpdate {
         len: usize,
+        stream_data_lens: Vec<(u32, usize)>,
     },
     Write {
         buf: Vec<u8>,
@@ -62,9 +63,12 @@ pub async fn writer_task(
             RespJob::Status { stream_id, status } => {
                 http2::build_status(stream_id, status, &mut hpack_encoder, &mut output);
             }
-            RespJob::WindowUpdate { len } => {
+            RespJob::WindowUpdate { len, stream_data_lens } => {
                 if len > 0 {
-                    http2::build_window_update(len, &mut output);
+                    http2::build_window_update(len, 0, &mut output);
+                    for (stream_id, stream_len) in stream_data_lens {
+                        http2::build_window_update(stream_len, stream_id, &mut output);
+                    }
                 }
             }
             RespJob::Write { buf } => {

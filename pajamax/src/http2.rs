@@ -275,11 +275,11 @@ pub fn build_status(
     );
 }
 
-pub fn build_window_update(len: usize, output: &mut Vec<u8>) {
+pub fn build_window_update(len: usize, stream_id: u32, output: &mut Vec<u8>) {
     let start = output.len();
     output.resize(start + Frame::HEAD_SIZE + 4, 0);
 
-    Frame::build_head(4, FrameKind::WindowUpdate, 0, 0, &mut output[start..]);
+    Frame::build_head(4, FrameKind::WindowUpdate, 0, stream_id, &mut output[start..]);
 
     build_u32(len as u32, &mut output[start + Frame::HEAD_SIZE..]);
 }
