@@ -14,11 +14,11 @@ path = "src/dict_store.rs"
 
 [dependencies]
 pajamax = {path="../pajamax/"}
-prost = "0.13.5"
+prost = "0.14"
 async-trait = "0.1"
 local-sync = "0.1"
 compio = { version = "0.18", features = ["net"] }
 
 [build-dependencies]
-prost-build = "0.13.5"
+prost-build = "0.14"
 pajamax-build = {path="../pajamax-build/"}
