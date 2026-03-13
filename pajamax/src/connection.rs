@@ -234,7 +234,8 @@ async fn handle_connection(
     }).detach();
 
     // Read and parse input data
-    let mut input: Vec<u8> = vec![0u8; config.max_frame_size];
+    let mut input: Vec<u8> = vec![0u8; config.read_buffer_size];
+    let mut read_buf: Vec<u8> = vec![0u8; config.read_buffer_size];
     let mut last_end: usize = 0;
     let mut streams: VecDeque<Stream> = VecDeque::new();
     let mut hpack_decoder = Decoder::new();
@@ -243,18 +244,8 @@ async fn handle_connection(
     let mut last_client_stream_id: u32 = 0;
 
     loop {
-        // Read data using ownership-based I/O
-        let read_buf = if last_end < input.len() {
-            // We have space in the buffer after last_end
-            let slice = input.split_off(last_end);
-            let remaining = input;
-            input = remaining;
-            slice
-        } else {
-            vec![0u8; config.max_frame_size]
-        };
-
         let BufResult(res, returned_buf) = reader.read(read_buf).await;
+        read_buf = returned_buf;
         let len = match res {
             Ok(0) => return Ok(()), // connection closed
             Ok(n) => n,
@@ -264,8 +255,11 @@ async fn handle_connection(
         trace!("receive data {len}");
 
         // Append read data to input buffer
-        input.extend_from_slice(&returned_buf[..len]);
-        let end = input.len();
+        let end = last_end + len;
+        if input.len() < end {
+            input.resize(end, 0);
+        }
+        input[last_end..end].copy_from_slice(&read_buf[..len]);
 
         let mut data_len = 0;
         let mut stream_data_lens: Vec<(u32, usize)> = Vec::new();
@@ -541,7 +535,20 @@ async fn handle_connection(
 
         // Shift leftover data for next loop
         if pos == 0 {
-            return Err(Error::InvalidHttp2("too long frame"));
+            if end >= 3 {
+                let declared_len = ((input[0] as usize) << 16)
+                    | ((input[1] as usize) << 8)
+                    | input[2] as usize;
+                if declared_len > config.read_buffer_size {
+                    return Err(Error::InvalidHttp2("too long frame"));
+                }
+            }
+            last_end = end;
+            let needed = last_end.saturating_add(config.read_buffer_size);
+            if input.len() < needed {
+                input.resize(needed, 0);
+            }
+            continue;
         }
         if pos < end {
             trace!("left data {}", end - pos);
@@ -553,8 +560,8 @@ async fn handle_connection(
             last_end = 0;
         }
         // Ensure input has capacity for next read
-        if input.len() < config.max_frame_size {
-            input.resize(config.max_frame_size, 0);
+        if input.len() < config.read_buffer_size {
+            input.resize(config.read_buffer_size, 0);
         }
     }
 }

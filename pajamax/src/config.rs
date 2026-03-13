@@ -90,6 +90,7 @@ pub struct Config {
     pub(crate) max_concurrent_connections: usize,
     pub(crate) max_concurrent_streams: usize,
     pub(crate) max_frame_size: usize,
+    pub(crate) read_buffer_size: usize,
     pub(crate) max_flush_requests: usize,
     pub(crate) max_flush_size: usize,
     pub(crate) idle_timeout: Duration,
@@ -104,6 +105,7 @@ impl Config {
             max_concurrent_connections: 100,
             max_concurrent_streams: 1000,
             max_frame_size: 16 * 1024,
+            read_buffer_size: 256 * 1024,
             max_flush_requests: 50,
             max_flush_size: 15000,
             idle_timeout: Duration::from_secs(60),
@@ -122,6 +124,10 @@ impl Config {
 
     pub fn max_frame_size(self, n: usize) -> Self {
         Self { max_frame_size: n, ..self }
+    }
+
+    pub fn read_buffer_size(self, n: usize) -> Self {
+        Self { read_buffer_size: n, ..self }
     }
 
     pub fn max_flush_requests(self, n: usize) -> Self {
