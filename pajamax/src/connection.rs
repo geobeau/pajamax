@@ -233,15 +233,28 @@ async fn handle_connection(
         }
     }).detach();
 
-    // Read and parse input data
-    let mut input: Vec<u8> = vec![0u8; config.read_buffer_size];
+    // Streaming frame parser state
     let mut read_buf: Vec<u8> = vec![0u8; config.read_buffer_size];
-    let mut last_end: usize = 0;
     let mut streams: VecDeque<Stream> = VecDeque::new();
     let mut hpack_decoder = Decoder::new();
     let mut route_cache: Vec<(usize, usize)> = Vec::new();
-    let mut continuation_buf: Option<(u32, bool, Vec<u8>)> = None; // (stream_id, end_stream, accumulated headers)
+    let mut continuation_buf: Option<(u32, bool, Vec<u8>)> = None;
     let mut last_client_stream_id: u32 = 0;
+
+    // State machine buffers
+    let mut header_buf = [0u8; 9];
+    let mut header_len: usize = 0;
+    let mut control_buf: Vec<u8> = Vec::new();
+    let mut cur_kind = FrameKind::Unknown;
+    let mut cur_flags = HeadFlags::from(0);
+    let mut cur_stream_id: u32 = 0;
+    let mut cur_payload_len: usize = 0;
+    let mut cur_payload_read: usize = 0;
+    let mut state = ParseState::Header;
+
+    // Window update tracking across a full read
+    let mut data_len: usize = 0;
+    let mut stream_data_lens: Vec<(u32, usize)> = Vec::new();
 
     loop {
         let BufResult(res, returned_buf) = reader.read(read_buf).await;
@@ -254,314 +267,397 @@ async fn handle_connection(
 
         trace!("receive data {len}");
 
-        // Append read data to input buffer
-        let end = last_end + len;
-        if input.len() < end {
-            input.resize(end, 0);
-        }
-        input[last_end..end].copy_from_slice(&read_buf[..len]);
+        data_len = 0;
+        stream_data_lens.clear();
 
-        let mut data_len = 0;
-        let mut stream_data_lens: Vec<(u32, usize)> = Vec::new();
         let mut pos = 0;
-        while let Some(frame) = Frame::parse(&input[pos..end]) {
-            pos += Frame::HEAD_SIZE + frame.len;
+        while pos < len {
+            match state {
+                ParseState::Header => {
+                    let need = 9 - header_len;
+                    let avail = len - pos;
+                    let take = need.min(avail);
+                    header_buf[header_len..header_len + take].copy_from_slice(&read_buf[pos..pos + take]);
+                    header_len += take;
+                    pos += take;
 
-            trace!(
-                "get frame {:?} {:?}, len:{}, stream_id:{}",
-                frame.kind,
-                frame.flags,
-                frame.len,
-                frame.stream_id
-            );
-
-            // When expecting CONTINUATION, reject any other frame type on the same connection
-            if let Some((cont_stream_id, _, _)) = &continuation_buf {
-                if frame.kind != FrameKind::Continuation {
-                    return Err(Error::InvalidHttp2("expected CONTINUATION frame"));
-                }
-                if frame.stream_id != *cont_stream_id {
-                    return Err(Error::InvalidHttp2("CONTINUATION stream ID mismatch"));
-                }
-            }
-
-            match frame.kind {
-                FrameKind::Data | FrameKind::Headers if frame.stream_id == 0 => {
-                    return Err(Error::InvalidHttp2("DATA/HEADERS must not be on stream 0"));
-                }
-                FrameKind::Settings | FrameKind::Ping | FrameKind::GoAway if frame.stream_id != 0 => {
-                    return Err(Error::InvalidHttp2("SETTINGS/PING/GOAWAY must be on stream 0"));
-                }
-                FrameKind::Headers => {
-                    if frame.stream_id % 2 == 0 {
-                        return Err(Error::InvalidHttp2("client stream ID must be odd"));
-                    }
-                    if frame.stream_id <= last_client_stream_id {
-                        return Err(Error::InvalidHttp2("client stream ID must be monotonically increasing"));
-                    }
-                    last_client_stream_id = frame.stream_id;
-
-                    if streams.len() >= config.max_concurrent_streams {
-                        let mut output = Vec::new();
-                        crate::http2::build_rst_stream(frame.stream_id, 7, &mut output); // REFUSED_STREAM
-                        let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
+                    if header_len < 9 {
                         continue;
                     }
 
-                    let headers_buf = frame.process_headers()?;
+                    let hdr = FrameHeader::parse(&header_buf).unwrap();
+                    cur_kind = hdr.kind;
+                    cur_flags = hdr.flags;
+                    cur_stream_id = hdr.stream_id;
+                    cur_payload_len = hdr.len;
+                    cur_payload_read = 0;
+                    header_len = 0;
 
-                    if !frame.flags.is_end_headers() {
-                        let buf = Vec::from(headers_buf);
-                        continuation_buf = Some((frame.stream_id, frame.flags.is_end_stream(), buf));
+                    trace!(
+                        "get frame {:?} {:?}, len:{}, stream_id:{}",
+                        cur_kind, cur_flags, cur_payload_len, cur_stream_id
+                    );
+
+                    if cur_payload_len == 0 {
+                        if process_frame(
+                            cur_kind, cur_flags, cur_stream_id, cur_payload_len,
+                            &[], &services, &resp_tx,
+                            &mut streams, &mut hpack_decoder, &mut route_cache,
+                            &mut continuation_buf, &mut last_client_stream_id,
+                            &mut data_len, &mut stream_data_lens, &config,
+                        )? {
+                            return Ok(());
+                        }
+                    } else {
+                        if cur_kind == FrameKind::Data && !cur_flags.is_padded() {
+                            if let Some(s) = streams.iter_mut().find(|s| s.id == cur_stream_id) {
+                                s.data.reserve(cur_payload_len);
+                            }
+                        } else {
+                            control_buf.clear();
+                            control_buf.reserve(cur_payload_len);
+                        }
+                        state = ParseState::Payload;
+                    }
+                }
+                ParseState::Payload => {
+                    let remaining = cur_payload_len - cur_payload_read;
+                    let avail = len - pos;
+                    let take = remaining.min(avail);
+
+                    if cur_kind == FrameKind::Data && !cur_flags.is_padded() {
+                        if let Some(s) = streams.iter_mut().find(|s| s.id == cur_stream_id) {
+                            s.data.extend_from_slice(&read_buf[pos..pos + take]);
+                        }
+                    } else {
+                        control_buf.extend_from_slice(&read_buf[pos..pos + take]);
+                    }
+
+                    cur_payload_read += take;
+                    pos += take;
+
+                    if cur_payload_read < cur_payload_len {
                         continue;
                     }
 
-                    let end_stream = frame.flags.is_end_stream();
-                    let (isvc, req_disc) = match hpack_decoder.find_path(headers_buf)? {
-                        PathKind::Cached(cached) => {
-                            trace!("route cache hit: {cached}");
-                            route_cache[cached]
-                        }
-                        PathKind::Plain(path) => {
-                            let len0 = route_cache.len();
-                            for (i, svc) in services.iter().enumerate() {
-                                if let Some(req_disc) = svc.route(&path) {
-                                    route_cache.push((i, req_disc));
-                                    break;
-                                }
-                            }
-                            if route_cache.len() == len0 {
-                                return Err(Error::UnknownMethod(
-                                    String::from_utf8_lossy(&path).into(),
-                                ));
-                            }
-                            trace!(
-                                "route cache new ({len0}): {}",
-                                String::from_utf8_lossy(&path)
-                            );
-                            route_cache[len0]
-                        }
-                    };
+                    // Frame complete
+                    if cur_kind == FrameKind::Data && !cur_flags.is_padded() {
+                        data_len += cur_payload_len;
+                        stream_data_lens.push((cur_stream_id, cur_payload_len));
 
-                    if end_stream {
-                        let id = frame.stream_id;
+                        let Some(i) = streams.iter().position(|s| s.id == cur_stream_id) else {
+                            state = ParseState::Header;
+                            continue;
+                        };
+
+                        if !cur_flags.is_end_stream() {
+                            state = ParseState::Header;
+                            continue;
+                        }
+
+                        let Stream { id, isvc, req_disc, mut data, .. } = streams.remove(i).unwrap();
+
+                        if data.len() < 5 {
+                            return Err(Error::InvalidHttp2("DATA too short for grpc"));
+                        }
+                        data.drain(..5);
+
+                        trace!("handle isvc:{isvc}, req_disc:{req_disc}");
+
                         let svc = services[isvc].clone();
                         let resp_tx = resp_tx.clone();
-                        trace!("handle (no body) isvc:{isvc}, req_disc:{req_disc}");
                         compio::runtime::spawn(async move {
-                            if let Err(e) = svc.handle(req_disc, &[], id, &resp_tx).await {
-                                error!("handle error: {:?}", e);
+                            if let Err(e) = svc.handle(req_disc, &data, id, &resp_tx).await {
+                                if !matches!(e, Error::ChannelClosed) {
+                                    error!("handle error: {:?}", e);
+                                }
                             }
                         }).detach();
                     } else {
-                        streams.push_back(Stream {
-                            id: frame.stream_id,
-                            isvc,
-                            req_disc,
-                            data: Vec::new(),
-                        });
-                    }
-                }
-                FrameKind::Continuation => {
-                    let Some((cont_stream_id, end_stream, ref mut buf)) = continuation_buf else {
-                        return Err(Error::InvalidHttp2("unexpected CONTINUATION frame"));
-                    };
-
-                    buf.extend_from_slice(frame.payload);
-
-                    if !frame.flags.is_end_headers() {
-                        continue;
-                    }
-
-                    let stream_id = cont_stream_id;
-                    let end_stream = end_stream;
-                    let headers_buf = std::mem::take(buf);
-                    continuation_buf = None;
-
-                    let (isvc, req_disc) = match hpack_decoder.find_path(&headers_buf)? {
-                        PathKind::Cached(cached) => {
-                            trace!("route cache hit: {cached}");
-                            route_cache[cached]
+                        if process_frame(
+                            cur_kind, cur_flags, cur_stream_id, cur_payload_len,
+                            &control_buf, &services, &resp_tx,
+                            &mut streams, &mut hpack_decoder, &mut route_cache,
+                            &mut continuation_buf, &mut last_client_stream_id,
+                            &mut data_len, &mut stream_data_lens, &config,
+                        )? {
+                            return Ok(());
                         }
-                        PathKind::Plain(path) => {
-                            let len0 = route_cache.len();
-                            for (i, svc) in services.iter().enumerate() {
-                                if let Some(req_disc) = svc.route(&path) {
-                                    route_cache.push((i, req_disc));
-                                    break;
-                                }
-                            }
-                            if route_cache.len() == len0 {
-                                return Err(Error::UnknownMethod(
-                                    String::from_utf8_lossy(&path).into(),
-                                ));
-                            }
-                            trace!(
-                                "route cache new ({len0}): {}",
-                                String::from_utf8_lossy(&path)
-                            );
-                            route_cache[len0]
-                        }
-                    };
-
-                    if end_stream {
-                        let svc = services[isvc].clone();
-                        let resp_tx = resp_tx.clone();
-                        trace!("handle (no body) isvc:{isvc}, req_disc:{req_disc}");
-                        compio::runtime::spawn(async move {
-                            if let Err(e) = svc.handle(req_disc, &[], stream_id, &resp_tx).await {
-                                error!("handle error: {:?}", e);
-                            }
-                        }).detach();
-                    } else {
-                        streams.push_back(Stream {
-                            id: stream_id,
-                            isvc,
-                            req_disc,
-                            data: Vec::new(),
-                        });
                     }
+                    state = ParseState::Header;
                 }
-
-                FrameKind::Settings => {
-                    if !frame.flags.is_ack() {
-                        // Parse client SETTINGS parameters
-                        let mut offset = 0;
-                        while offset + 6 <= frame.len {
-                            let ident = u16::from_be_bytes([frame.payload[offset], frame.payload[offset + 1]]);
-                            let value = u32::from_be_bytes([
-                                frame.payload[offset + 2], frame.payload[offset + 3],
-                                frame.payload[offset + 4], frame.payload[offset + 5],
-                            ]);
-                            match ident {
-                                1 => trace!("client SETTINGS_HEADER_TABLE_SIZE: {value}"),
-                                2 => trace!("client SETTINGS_ENABLE_PUSH: {value}"),
-                                3 => trace!("client SETTINGS_MAX_CONCURRENT_STREAMS: {value}"),
-                                4 => trace!("client SETTINGS_INITIAL_WINDOW_SIZE: {value}"),
-                                5 => trace!("client SETTINGS_MAX_FRAME_SIZE: {value}"),
-                                6 => trace!("client SETTINGS_MAX_HEADER_LIST_SIZE: {value}"),
-                                _ => trace!("client SETTINGS unknown ident:{ident} value:{value}"),
-                            }
-                            offset += 6;
-                        }
-
-                        let mut output = Vec::new();
-                        crate::http2::build_settings_ack(&mut output);
-                        let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
-                    }
-                }
-                FrameKind::Ping => {
-                    if !frame.flags.is_ping_ack() {
-                        let mut output = Vec::new();
-                        crate::http2::build_ping_ack(frame.payload, &mut output);
-                        let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
-                    }
-                }
-                FrameKind::GoAway => {
-                    if frame.len < 8 {
-                        return Err(Error::InvalidHttp2("GOAWAY payload must be at least 8 bytes"));
-                    }
-                    let last_stream_id = u32::from_be_bytes([
-                        frame.payload[0] & 0x7f, frame.payload[1], frame.payload[2], frame.payload[3],
-                    ]);
-                    let error_code = u32::from_be_bytes([
-                        frame.payload[4], frame.payload[5], frame.payload[6], frame.payload[7],
-                    ]);
-                    trace!("GOAWAY last_stream_id:{last_stream_id} error_code:{error_code}");
-                    return Ok(());
-                }
-                FrameKind::Reset => {
-                    if frame.len != 4 {
-                        return Err(Error::InvalidHttp2("RST_STREAM payload must be 4 bytes"));
-                    }
-                    if let Some(i) = streams.iter().position(|s| s.id == frame.stream_id) {
-                        streams.remove(i);
-                    }
-                    trace!("RST_STREAM stream_id:{}", frame.stream_id);
-                }
-                FrameKind::Data => {
-                    let req_buf = frame.process_data()?;
-
-                    data_len += frame.len;
-                    stream_data_lens.push((frame.stream_id, frame.len));
-
-                    let Some(i) = streams.iter().position(|s| s.id == frame.stream_id) else {
-                        continue;
-                    };
-
-                    streams[i].data.extend_from_slice(req_buf);
-
-                    if !frame.flags.is_end_stream() {
-                        continue;
-                    }
-
-                    let Stream { id, isvc, req_disc, data, .. } = streams.remove(i).unwrap();
-
-                    if data.len() < 5 {
-                        return Err(Error::InvalidHttp2("DATA too short for grpc"));
-                    }
-                    let req_buf = data[5..].to_vec();
-
-                    trace!("handle isvc:{isvc}, req_disc:{req_disc}");
-
-                    let svc = services[isvc].clone();
-                    let resp_tx = resp_tx.clone();
-                    compio::runtime::spawn(async move {
-                        if let Err(e) = svc.handle(req_disc, &req_buf, id, &resp_tx).await {
-                            error!("handle error: {:?}", e);
-                        }
-                    }).detach();
-                }
-                FrameKind::WindowUpdate => {
-                    if frame.len != 4 {
-                        return Err(Error::InvalidHttp2("WINDOW_UPDATE payload must be 4 bytes"));
-                    }
-                    let increment = u32::from_be_bytes([
-                        frame.payload[0] & 0x7f, frame.payload[1], frame.payload[2], frame.payload[3],
-                    ]);
-                    if increment == 0 {
-                        return Err(Error::InvalidHttp2("WINDOW_UPDATE increment must be non-zero"));
-                    }
-                    trace!("WINDOW_UPDATE stream_id:{} increment:{increment}", frame.stream_id);
-                }
-                _ => (),
             }
         }
 
         // Send window update
         if data_len > 0 {
-            let _ = resp_tx.send(response_end::RespJob::WindowUpdate { len: data_len, stream_data_lens });
+            let _ = resp_tx.send(response_end::RespJob::WindowUpdate { len: data_len, stream_data_lens: std::mem::take(&mut stream_data_lens) });
         }
+    }
+}
 
-        // Shift leftover data for next loop
-        if pos == 0 {
-            if end >= 3 {
-                let declared_len = ((input[0] as usize) << 16)
-                    | ((input[1] as usize) << 8)
-                    | input[2] as usize;
-                if declared_len > config.read_buffer_size {
-                    return Err(Error::InvalidHttp2("too long frame"));
+enum ParseState {
+    Header,
+    Payload,
+}
+
+/// Process a complete frame (or zero-length frame). Returns true if the
+/// connection should be closed (GoAway).
+fn process_frame(
+    kind: FrameKind,
+    flags: HeadFlags,
+    stream_id: u32,
+    payload_len: usize,
+    payload: &[u8],
+    services: &[Rc<dyn PajamaxService>],
+    resp_tx: &response_end::RespTx,
+    streams: &mut VecDeque<Stream>,
+    hpack_decoder: &mut Decoder,
+    route_cache: &mut Vec<(usize, usize)>,
+    continuation_buf: &mut Option<(u32, bool, Vec<u8>)>,
+    last_client_stream_id: &mut u32,
+    data_len: &mut usize,
+    stream_data_lens: &mut Vec<(u32, usize)>,
+    config: &Config,
+) -> Result<bool, Error> {
+    // When expecting CONTINUATION, reject any other frame type
+    if let Some((cont_stream_id, _, _)) = continuation_buf {
+        if kind != FrameKind::Continuation {
+            return Err(Error::InvalidHttp2("expected CONTINUATION frame"));
+        }
+        if stream_id != *cont_stream_id {
+            return Err(Error::InvalidHttp2("CONTINUATION stream ID mismatch"));
+        }
+    }
+
+    match kind {
+        FrameKind::Data | FrameKind::Headers if stream_id == 0 => {
+            return Err(Error::InvalidHttp2("DATA/HEADERS must not be on stream 0"));
+        }
+        FrameKind::Settings | FrameKind::Ping | FrameKind::GoAway if stream_id != 0 => {
+            return Err(Error::InvalidHttp2("SETTINGS/PING/GOAWAY must be on stream 0"));
+        }
+        FrameKind::Data => {
+            let req_buf = Frame::strip_data_padding(flags, payload)?;
+
+            *data_len += payload_len;
+            stream_data_lens.push((stream_id, payload_len));
+
+            let Some(i) = streams.iter().position(|s| s.id == stream_id) else {
+                return Ok(false);
+            };
+
+            streams[i].data.extend_from_slice(req_buf);
+
+            if !flags.is_end_stream() {
+                return Ok(false);
+            }
+
+            let Stream { id, isvc, req_disc, mut data, .. } = streams.remove(i).unwrap();
+
+            if data.len() < 5 {
+                return Err(Error::InvalidHttp2("DATA too short for grpc"));
+            }
+            data.drain(..5);
+
+            trace!("handle isvc:{isvc}, req_disc:{req_disc}");
+
+            let svc = services[isvc].clone();
+            let resp_tx = resp_tx.clone();
+            compio::runtime::spawn(async move {
+                if let Err(e) = svc.handle(req_disc, &data, id, &resp_tx).await {
+                    if !matches!(e, Error::ChannelClosed) {
+                        error!("handle error: {:?}", e);
+                    }
+                }
+            }).detach();
+        }
+        FrameKind::Headers => {
+            if stream_id % 2 == 0 {
+                return Err(Error::InvalidHttp2("client stream ID must be odd"));
+            }
+            if stream_id <= *last_client_stream_id {
+                return Err(Error::InvalidHttp2("client stream ID must be monotonically increasing"));
+            }
+            *last_client_stream_id = stream_id;
+
+            if streams.len() >= config.max_concurrent_streams {
+                let mut output = Vec::new();
+                crate::http2::build_rst_stream(stream_id, 7, &mut output);
+                let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
+                return Ok(false);
+            }
+
+            let headers_buf = Frame::strip_headers(flags, payload)?;
+
+            if !flags.is_end_headers() {
+                let buf = Vec::from(headers_buf);
+                *continuation_buf = Some((stream_id, flags.is_end_stream(), buf));
+                return Ok(false);
+            }
+
+            let end_stream = flags.is_end_stream();
+            let (isvc, req_disc) = resolve_route(hpack_decoder, route_cache, services, headers_buf)?;
+
+            if end_stream {
+                let svc = services[isvc].clone();
+                let resp_tx = resp_tx.clone();
+                trace!("handle (no body) isvc:{isvc}, req_disc:{req_disc}");
+                compio::runtime::spawn(async move {
+                    if let Err(e) = svc.handle(req_disc, &[], stream_id, &resp_tx).await {
+                        if !matches!(e, Error::ChannelClosed) {
+                            error!("handle error: {:?}", e);
+                        }
+                    }
+                }).detach();
+            } else {
+                streams.push_back(Stream {
+                    id: stream_id,
+                    isvc,
+                    req_disc,
+                    data: Vec::new(),
+                });
+            }
+        }
+        FrameKind::Continuation => {
+            let Some((cont_stream_id, end_stream, ref mut buf)) = continuation_buf else {
+                return Err(Error::InvalidHttp2("unexpected CONTINUATION frame"));
+            };
+
+            buf.extend_from_slice(payload);
+
+            if !flags.is_end_headers() {
+                return Ok(false);
+            }
+
+            let stream_id = *cont_stream_id;
+            let end_stream = *end_stream;
+            let headers_buf = std::mem::take(buf);
+            *continuation_buf = None;
+
+            let (isvc, req_disc) = resolve_route(hpack_decoder, route_cache, services, &headers_buf)?;
+
+            if end_stream {
+                let svc = services[isvc].clone();
+                let resp_tx = resp_tx.clone();
+                trace!("handle (no body) isvc:{isvc}, req_disc:{req_disc}");
+                compio::runtime::spawn(async move {
+                    if let Err(e) = svc.handle(req_disc, &[], stream_id, &resp_tx).await {
+                        if !matches!(e, Error::ChannelClosed) {
+                            error!("handle error: {:?}", e);
+                        }
+                    }
+                }).detach();
+            } else {
+                streams.push_back(Stream {
+                    id: stream_id,
+                    isvc,
+                    req_disc,
+                    data: Vec::new(),
+                });
+            }
+        }
+        FrameKind::Settings => {
+            if !flags.is_ack() {
+                let mut offset = 0;
+                while offset + 6 <= payload_len {
+                    let ident = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+                    let value = u32::from_be_bytes([
+                        payload[offset + 2], payload[offset + 3],
+                        payload[offset + 4], payload[offset + 5],
+                    ]);
+                    match ident {
+                        1 => trace!("client SETTINGS_HEADER_TABLE_SIZE: {value}"),
+                        2 => trace!("client SETTINGS_ENABLE_PUSH: {value}"),
+                        3 => trace!("client SETTINGS_MAX_CONCURRENT_STREAMS: {value}"),
+                        4 => trace!("client SETTINGS_INITIAL_WINDOW_SIZE: {value}"),
+                        5 => trace!("client SETTINGS_MAX_FRAME_SIZE: {value}"),
+                        6 => trace!("client SETTINGS_MAX_HEADER_LIST_SIZE: {value}"),
+                        _ => trace!("client SETTINGS unknown ident:{ident} value:{value}"),
+                    }
+                    offset += 6;
+                }
+
+                let mut output = Vec::new();
+                crate::http2::build_settings_ack(&mut output);
+                let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
+            }
+        }
+        FrameKind::Ping => {
+            if !flags.is_ping_ack() {
+                let mut output = Vec::new();
+                crate::http2::build_ping_ack(payload, &mut output);
+                let _ = resp_tx.send(response_end::RespJob::Write { buf: output });
+            }
+        }
+        FrameKind::GoAway => {
+            if payload_len < 8 {
+                return Err(Error::InvalidHttp2("GOAWAY payload must be at least 8 bytes"));
+            }
+            let last_stream_id = u32::from_be_bytes([
+                payload[0] & 0x7f, payload[1], payload[2], payload[3],
+            ]);
+            let error_code = u32::from_be_bytes([
+                payload[4], payload[5], payload[6], payload[7],
+            ]);
+            trace!("GOAWAY last_stream_id:{last_stream_id} error_code:{error_code}");
+            return Ok(true);
+        }
+        FrameKind::Reset => {
+            if payload_len != 4 {
+                return Err(Error::InvalidHttp2("RST_STREAM payload must be 4 bytes"));
+            }
+            if let Some(i) = streams.iter().position(|s| s.id == stream_id) {
+                streams.remove(i);
+            }
+            trace!("RST_STREAM stream_id:{}", stream_id);
+        }
+        FrameKind::WindowUpdate => {
+            if payload_len != 4 {
+                return Err(Error::InvalidHttp2("WINDOW_UPDATE payload must be 4 bytes"));
+            }
+            let increment = u32::from_be_bytes([
+                payload[0] & 0x7f, payload[1], payload[2], payload[3],
+            ]);
+            if increment == 0 {
+                return Err(Error::InvalidHttp2("WINDOW_UPDATE increment must be non-zero"));
+            }
+            trace!("WINDOW_UPDATE stream_id:{stream_id} increment:{increment}");
+        }
+        _ => (),
+    }
+    Ok(false)
+}
+
+fn resolve_route(
+    hpack_decoder: &mut Decoder,
+    route_cache: &mut Vec<(usize, usize)>,
+    services: &[Rc<dyn PajamaxService>],
+    headers_buf: &[u8],
+) -> Result<(usize, usize), Error> {
+    match hpack_decoder.find_path(headers_buf)? {
+        PathKind::Cached(cached) => {
+            trace!("route cache hit: {cached}");
+            Ok(route_cache[cached])
+        }
+        PathKind::Plain(path) => {
+            let len0 = route_cache.len();
+            for (i, svc) in services.iter().enumerate() {
+                if let Some(req_disc) = svc.route(&path) {
+                    route_cache.push((i, req_disc));
+                    break;
                 }
             }
-            last_end = end;
-            let needed = last_end.saturating_add(config.read_buffer_size);
-            if input.len() < needed {
-                input.resize(needed, 0);
+            if route_cache.len() == len0 {
+                return Err(Error::UnknownMethod(
+                    String::from_utf8_lossy(&path).into(),
+                ));
             }
-            continue;
-        }
-        if pos < end {
-            trace!("left data {}", end - pos);
-            input.copy_within(pos..end, 0);
-            input.truncate(end - pos);
-            last_end = end - pos;
-        } else {
-            input.clear();
-            last_end = 0;
-        }
-        // Ensure input has capacity for next read
-        if input.len() < config.read_buffer_size {
-            input.resize(config.read_buffer_size, 0);
+            trace!(
+                "route cache new ({len0}): {}",
+                String::from_utf8_lossy(&path)
+            );
+            Ok(route_cache[len0])
         }
     }
 }

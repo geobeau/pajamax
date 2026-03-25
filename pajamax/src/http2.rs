@@ -120,6 +120,62 @@ impl<'a> Frame<'a> {
             Ok(buf)
         }
     }
+
+    /// Strip padding from a data payload (public for streaming parser).
+    pub fn strip_data_padding(flags: HeadFlags, buf: &[u8]) -> Result<&[u8], Error> {
+        if flags.is_padded() {
+            if buf.is_empty() {
+                return Err(Error::InvalidHttp2("invalid padded"));
+            }
+            let pad_len = buf[0] as usize;
+            let buf_len = buf.len();
+            if buf_len <= 1 + pad_len {
+                return Err(Error::InvalidHttp2("invalid padded"));
+            }
+            Ok(&buf[1..buf_len - pad_len])
+        } else {
+            Ok(buf)
+        }
+    }
+
+    /// Strip padding and priority from a headers payload (public for streaming parser).
+    pub fn strip_headers(flags: HeadFlags, buf: &[u8]) -> Result<&[u8], Error> {
+        let buf = Self::strip_data_padding(flags, buf)?;
+        if flags.is_priority() {
+            if buf.len() < 5 {
+                return Err(Error::InvalidHttp2("invalid priority"));
+            }
+            Ok(&buf[5..])
+        } else {
+            Ok(buf)
+        }
+    }
+}
+
+/// Parsed frame header (9 bytes), without requiring the payload to be present.
+#[derive(Debug, Copy, Clone)]
+pub struct FrameHeader {
+    pub len: usize,
+    pub kind: FrameKind,
+    pub flags: HeadFlags,
+    pub stream_id: u32,
+}
+
+impl FrameHeader {
+    /// Parse a 9-byte frame header. Returns None if buf has fewer than 9 bytes.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Frame::HEAD_SIZE {
+            return None;
+        }
+        let tmp: [u8; 4] = [0, buf[0], buf[1], buf[2]];
+        let len = u32::from_be_bytes(tmp) as usize;
+        Some(Self {
+            len,
+            kind: FrameKind::from(buf[3]),
+            flags: HeadFlags::from(buf[4]),
+            stream_id: parse_u32(&buf[5..]) & 0x7FFF_FFFF,
+        })
+    }
 }
 
 pub async fn handshake<S>(stream: &mut S, config: &Config) -> Result<(), Error>
@@ -164,7 +220,7 @@ impl HeadFlags {
 
     pub const PING_ACK: u8 = 0x1;
 
-    fn from(flag: u8) -> Self {
+    pub fn from(flag: u8) -> Self {
         Self(flag)
     }
     pub fn is_end_stream(self) -> bool {
@@ -173,10 +229,10 @@ impl HeadFlags {
     pub fn is_end_headers(self) -> bool {
         self.0 & Self::END_HEADERS != 0
     }
-    fn is_padded(self) -> bool {
+    pub fn is_padded(self) -> bool {
         self.0 & Self::PADDED != 0
     }
-    fn is_priority(self) -> bool {
+    pub fn is_priority(self) -> bool {
         self.0 & Self::PRIORITY != 0
     }
     pub fn is_ack(self) -> bool {
