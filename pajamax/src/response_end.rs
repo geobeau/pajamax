@@ -1,5 +1,5 @@
 use compio::io::AsyncWriteExt;
-use compio::net::{OwnedWriteHalf, TcpStream};
+use compio::net::TcpStream;
 use compio::BufResult;
 
 use crate::config::Config;
@@ -40,7 +40,7 @@ pub fn resp_channel() -> (RespTx, RespRx) {
 /// The writer task that owns the write half of the TCP connection.
 /// It writes each response to the socket immediately.
 pub async fn writer_task(
-    mut writer: OwnedWriteHalf<TcpStream>,
+    mut writer: TcpStream,
     mut resp_rx: RespRx,
     _config: Config,
 ) -> Result<(), crate::error::Error> {

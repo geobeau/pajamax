@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use compio::io::AsyncRead;
+use compio::io::AsyncReadManaged;
 use compio::net::{TcpListener, TcpStream};
-use compio::BufResult;
+use compio::runtime::BufferPool;
 
 use crate::config::Config;
 use crate::error::Error;
@@ -100,6 +100,8 @@ pub async fn accept_loop(
     let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
     info!("listening on {}", addr);
 
+    let buffer_pool = Rc::new(BufferPool::new(config.buffer_pool_size, config.max_frame_size * 2)?);
+
     let concurrent = Rc::new(std::cell::Cell::new(0usize));
     let mut connections = 0;
     loop {
@@ -117,10 +119,11 @@ pub async fn accept_loop(
 
         let services = services.clone();
         let concurrent = concurrent.clone();
+        let buffer_pool = buffer_pool.clone();
         connections += 1;
         println!("Handled {connections} connections");
         compio::runtime::spawn(async move {
-            match handle_connection(services, stream, config).await {
+            match handle_connection(services, stream, config, buffer_pool).await {
                 Ok(_) => println!("connection closed"),
                 Err(err) => println!("connection fail: {:?}", err),
             }
@@ -173,6 +176,8 @@ async fn balanced_loop(
     }).detach();
 
     // Worker loop: receive connections from balancer channel via flume async
+    let buffer_pool = Rc::new(BufferPool::new(config.buffer_pool_size, config.max_frame_size * 2)?);
+
     let concurrent = Rc::new(std::cell::Cell::new(0usize));
     let mut connections = 0;
     while let Ok(std_stream) = rx.recv_async().await {
@@ -189,10 +194,11 @@ async fn balanced_loop(
 
         let services = services.clone();
         let concurrent = concurrent.clone();
+        let buffer_pool = buffer_pool.clone();
         connections += 1;
         println!("Handled {connections} connections");
         compio::runtime::spawn(async move {
-            match handle_connection(services, stream, config).await {
+            match handle_connection(services, stream, config, buffer_pool).await {
                 Ok(_) => println!("connection closed"),
                 Err(err) => println!("connection fail: {:?}", err),
             }
@@ -214,14 +220,15 @@ async fn handle_connection(
     services: Vec<Rc<dyn PajamaxService>>,
     stream: TcpStream,
     config: Config,
+    buffer_pool: Rc<BufferPool>,
 ) -> Result<(), Error> {
     // Handshake on full stream before splitting
     let mut stream = stream;
     crate::http2::handshake(&mut stream, &config).await?;
     trace!("handshake done");
 
-    // Split into read and write halves
-    let (mut reader, writer) = stream.into_split();
+    // Clone the stream for the writer (cheap fd dup); keep original for read_managed
+    let writer = stream.clone();
 
     // Create response channel
     let (resp_tx, resp_rx) = response_end::resp_channel();
@@ -234,7 +241,6 @@ async fn handle_connection(
     }).detach();
 
     // Streaming frame parser state
-    let mut read_buf: Vec<u8> = vec![0u8; config.read_buffer_size];
     let mut streams: VecDeque<Stream> = VecDeque::new();
     let mut hpack_decoder = Decoder::new();
     let mut route_cache: Vec<(usize, usize)> = Vec::new();
@@ -257,13 +263,13 @@ async fn handle_connection(
     let mut stream_data_lens: Vec<(u32, usize)> = Vec::new();
 
     loop {
-        let BufResult(res, returned_buf) = reader.read(read_buf).await;
-        read_buf = returned_buf;
-        let len = match res {
-            Ok(0) => return Ok(()), // connection closed
-            Ok(n) => n,
+        let managed_buf = match stream.read_managed(&buffer_pool, 0).await {
+            Ok(buf) if buf.len() == 0 => return Ok(()), // connection closed
+            Ok(buf) => buf,
             Err(e) => return Err(Error::IoFail(e)),
         };
+        let len = managed_buf.len();
+        let read_buf = managed_buf.as_ref();
 
         trace!("receive data {len}");
 

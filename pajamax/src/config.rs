@@ -96,6 +96,7 @@ pub struct Config {
     pub(crate) idle_timeout: Duration,
     pub(crate) write_timeout: Duration,
     pub(crate) num_cores: usize,
+    pub(crate) buffer_pool_size: u16,
 }
 
 impl Config {
@@ -111,6 +112,7 @@ impl Config {
             idle_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
             num_cores: 1,
+            buffer_pool_size: 256,
         }
     }
 
@@ -150,6 +152,12 @@ impl Config {
     /// Default: 1
     pub fn num_cores(self, n: usize) -> Self {
         Self { num_cores: n, ..self }
+    }
+
+    /// Number of buffers in the io_uring provided buffer pool per worker thread.
+    /// Must be a power of 2. Default: 256
+    pub fn buffer_pool_size(self, n: u16) -> Self {
+        Self { buffer_pool_size: n, ..self }
     }
 
     /// Add the first service, and return a ConfigedServer.
