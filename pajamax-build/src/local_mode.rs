@@ -90,7 +90,7 @@ fn gen_service_handle(service: &prost_build::Service, buf: &mut String) {
         "async fn handle(
             &self,
             req_disc: usize,
-            req_buf: &[u8],
+            req_buf: ::prost::bytes::Bytes,
             stream_id: u32,
             resp_tx: &pajamax::RespTx,
         ) -> Result<(), pajamax::error::Error> {{

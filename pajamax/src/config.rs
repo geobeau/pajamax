@@ -18,8 +18,8 @@ use crate::PajamaxService;
 ///     .unwrap();
 /// ```
 pub struct ConfigedServer {
-    pub(crate) config: Config,
-    pub(crate) services: Vec<Box<dyn Fn() -> Rc<dyn PajamaxService> + Send + Sync>>,
+    pub config: Config,
+    pub services: Vec<Box<dyn Fn() -> Rc<dyn PajamaxService> + Send + Sync>>,
 }
 
 impl ConfigedServer {
@@ -87,16 +87,16 @@ impl ConfigedServer {
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub struct Config {
-    pub(crate) max_concurrent_connections: usize,
-    pub(crate) max_concurrent_streams: usize,
-    pub(crate) max_frame_size: usize,
-    pub(crate) read_buffer_size: usize,
-    pub(crate) max_flush_requests: usize,
-    pub(crate) max_flush_size: usize,
-    pub(crate) idle_timeout: Duration,
-    pub(crate) write_timeout: Duration,
-    pub(crate) num_cores: usize,
-    pub(crate) buffer_pool_size: u16,
+    pub max_concurrent_connections: usize,
+    pub max_concurrent_streams: usize,
+    pub max_frame_size: usize,
+    pub read_buffer_size: usize,
+    pub max_flush_requests: usize,
+    pub max_flush_size: usize,
+    pub idle_timeout: Duration,
+    pub write_timeout: Duration,
+    pub num_cores: usize,
+    pub buffer_pool_size: u16,
 }
 
 impl Config {

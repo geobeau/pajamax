@@ -254,6 +254,7 @@ pub fn build_response(
     output.resize(start + Frame::HEAD_SIZE, 0);
     hpack_encoder.encode_status_200(output);
     hpack_encoder.encode_content_type(output);
+    hpack_encoder.encode_grpc_accept_encoding(output);
 
     Frame::build_head(
         output.len() - start - Frame::HEAD_SIZE,
@@ -319,6 +320,7 @@ pub fn build_status(
     output.resize(start + Frame::HEAD_SIZE, 0);
     hpack_encoder.encode_status_200(output);
     hpack_encoder.encode_content_type(output);
+    hpack_encoder.encode_grpc_accept_encoding(output);
     hpack_encoder.encode_grpc_status_nonzero(status.code as usize, output);
     hpack_encoder.encode_grpc_message(&status.message, output);
 

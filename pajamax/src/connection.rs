@@ -8,7 +8,7 @@ use compio::runtime::BufferPool;
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::hpack_decoder::{Decoder, PathKind};
+use crate::hpack_decoder::{Decoder, GrpcEncoding, PathKind};
 use crate::http2::*;
 use crate::macros::*;
 use crate::response_end;
@@ -213,6 +213,7 @@ struct Stream {
     id: u32,
     isvc: usize,
     req_disc: usize,
+    encoding: GrpcEncoding,
     data: Vec<u8>,
 }
 
@@ -361,19 +362,16 @@ async fn handle_connection(
                             continue;
                         }
 
-                        let Stream { id, isvc, req_disc, mut data, .. } = streams.remove(i).unwrap();
+                        let Stream { id, isvc, req_disc, encoding, data, .. } = streams.remove(i).unwrap();
 
-                        if data.len() < 5 {
-                            return Err(Error::InvalidHttp2("DATA too short for grpc"));
-                        }
-                        data.drain(..5);
+                        let data = decode_grpc_message(data, encoding)?;
 
                         trace!("handle isvc:{isvc}, req_disc:{req_disc}");
 
                         let svc = services[isvc].clone();
                         let resp_tx = resp_tx.clone();
                         compio::runtime::spawn(async move {
-                            if let Err(e) = svc.handle(req_disc, &data, id, &resp_tx).await {
+                            if let Err(e) = svc.handle(req_disc, data, id, &resp_tx).await {
                                 if !matches!(e, Error::ChannelClosed) {
                                     error!("handle error: {:?}", e);
                                 }
@@ -459,19 +457,16 @@ fn process_frame(
                 return Ok(false);
             }
 
-            let Stream { id, isvc, req_disc, mut data, .. } = streams.remove(i).unwrap();
+            let Stream { id, isvc, req_disc, encoding, data, .. } = streams.remove(i).unwrap();
 
-            if data.len() < 5 {
-                return Err(Error::InvalidHttp2("DATA too short for grpc"));
-            }
-            data.drain(..5);
+            let data = decode_grpc_message(data, encoding)?;
 
             trace!("handle isvc:{isvc}, req_disc:{req_disc}");
 
             let svc = services[isvc].clone();
             let resp_tx = resp_tx.clone();
             compio::runtime::spawn(async move {
-                if let Err(e) = svc.handle(req_disc, &data, id, &resp_tx).await {
+                if let Err(e) = svc.handle(req_disc, data, id, &resp_tx).await {
                     if !matches!(e, Error::ChannelClosed) {
                         error!("handle error: {:?}", e);
                     }
@@ -503,14 +498,14 @@ fn process_frame(
             }
 
             let end_stream = flags.is_end_stream();
-            let (isvc, req_disc) = resolve_route(hpack_decoder, route_cache, services, headers_buf)?;
+            let (isvc, req_disc, encoding) = resolve_route(hpack_decoder, route_cache, services, headers_buf)?;
 
             if end_stream {
                 let svc = services[isvc].clone();
                 let resp_tx = resp_tx.clone();
                 trace!("handle (no body) isvc:{isvc}, req_disc:{req_disc}");
                 compio::runtime::spawn(async move {
-                    if let Err(e) = svc.handle(req_disc, &[], stream_id, &resp_tx).await {
+                    if let Err(e) = svc.handle(req_disc, bytes::Bytes::new(), stream_id, &resp_tx).await {
                         if !matches!(e, Error::ChannelClosed) {
                             error!("handle error: {:?}", e);
                         }
@@ -521,6 +516,7 @@ fn process_frame(
                     id: stream_id,
                     isvc,
                     req_disc,
+                    encoding,
                     data: Vec::new(),
                 });
             }
@@ -541,14 +537,14 @@ fn process_frame(
             let headers_buf = std::mem::take(buf);
             *continuation_buf = None;
 
-            let (isvc, req_disc) = resolve_route(hpack_decoder, route_cache, services, &headers_buf)?;
+            let (isvc, req_disc, encoding) = resolve_route(hpack_decoder, route_cache, services, &headers_buf)?;
 
             if end_stream {
                 let svc = services[isvc].clone();
                 let resp_tx = resp_tx.clone();
                 trace!("handle (no body) isvc:{isvc}, req_disc:{req_disc}");
                 compio::runtime::spawn(async move {
-                    if let Err(e) = svc.handle(req_disc, &[], stream_id, &resp_tx).await {
+                    if let Err(e) = svc.handle(req_disc, bytes::Bytes::new(), stream_id, &resp_tx).await {
                         if !matches!(e, Error::ChannelClosed) {
                             error!("handle error: {:?}", e);
                         }
@@ -559,6 +555,7 @@ fn process_frame(
                     id: stream_id,
                     isvc,
                     req_disc,
+                    encoding,
                     data: Vec::new(),
                 });
             }
@@ -635,16 +632,53 @@ fn process_frame(
     Ok(false)
 }
 
+fn decode_grpc_message(data: Vec<u8>, encoding: GrpcEncoding) -> Result<bytes::Bytes, Error> {
+    if data.len() < 5 {
+        return Err(Error::InvalidHttp2("DATA too short for grpc"));
+    }
+    let compressed = data[0] != 0;
+
+    if !compressed {
+        return Ok(bytes::Bytes::from(data).slice(5..));
+    }
+
+    use std::io::Read;
+    let mut decoded = Vec::new();
+    match encoding {
+        GrpcEncoding::Gzip => {
+            flate2::read::GzDecoder::new(&data[5..])
+                .read_to_end(&mut decoded)
+                .map_err(Error::IoFail)?;
+        }
+        GrpcEncoding::Deflate => {
+            flate2::read::DeflateDecoder::new(&data[5..])
+                .read_to_end(&mut decoded)
+                .map_err(Error::IoFail)?;
+        }
+        GrpcEncoding::Zstd => {
+            zstd::Decoder::new(&data[5..])
+                .map_err(Error::IoFail)?
+                .read_to_end(&mut decoded)
+                .map_err(Error::IoFail)?;
+        }
+        GrpcEncoding::Identity => {
+            return Err(Error::InvalidHttp2("compressed flag set but no grpc-encoding"));
+        }
+    }
+    Ok(bytes::Bytes::from(decoded))
+}
+
 fn resolve_route(
     hpack_decoder: &mut Decoder,
     route_cache: &mut Vec<(usize, usize)>,
     services: &[Rc<dyn PajamaxService>],
     headers_buf: &[u8],
-) -> Result<(usize, usize), Error> {
-    match hpack_decoder.find_path(headers_buf)? {
+) -> Result<(usize, usize, GrpcEncoding), Error> {
+    let result = hpack_decoder.find_path_and_encoding(headers_buf)?;
+    let (isvc, req_disc) = match result.path {
         PathKind::Cached(cached) => {
             trace!("route cache hit: {cached}");
-            Ok(route_cache[cached])
+            route_cache[cached]
         }
         PathKind::Plain(path) => {
             let len0 = route_cache.len();
@@ -663,7 +697,8 @@ fn resolve_route(
                 "route cache new ({len0}): {}",
                 String::from_utf8_lossy(&path)
             );
-            Ok(route_cache[len0])
+            route_cache[len0]
         }
-    }
+    };
+    Ok((isvc, req_disc, result.encoding))
 }

@@ -82,7 +82,7 @@ pub trait PajamaxService {
     // 1. parse the request from req_disc(from route()) and req_buf,
     // 2. call the method defined in applications and make reply,
     // 3. response the reply to resp_tx.
-    async fn handle(&self, req_disc: usize, req_buf: &[u8], stream_id: u32, resp_tx: &response_end::RespTx) -> Result<(), error::Error>;
+    async fn handle(&self, req_disc: usize, req_buf: bytes::Bytes, stream_id: u32, resp_tx: &response_end::RespTx) -> Result<(), error::Error>;
 
     fn is_dispatch_mode(&self) -> bool;
 }

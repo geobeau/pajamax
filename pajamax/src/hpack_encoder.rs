@@ -65,6 +65,10 @@ impl Encoder {
         encode_header("grpc-message", msg, dst)
     }
 
+    pub fn encode_grpc_accept_encoding(&mut self, dst: &mut Vec<u8>) {
+        encode_header("grpc-accept-encoding", "gzip,deflate,zstd", dst)
+    }
+
     fn encode_and_index_header(&mut self, name: &str, value: &str, dst: &mut Vec<u8>) {
         encode_int(0, 6, 0x40, dst);
         encode_str(name, dst);

@@ -126,9 +126,28 @@ pub enum PathKind {
     Plain(Vec<u8>),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum GrpcEncoding {
+    #[default]
+    Identity,
+    Gzip,
+    Deflate,
+    Zstd,
+}
+
+pub struct HeaderResult {
+    pub path: PathKind,
+    pub encoding: GrpcEncoding,
+}
+
+struct DynamicTableEntry {
+    path_cache: Option<usize>,
+    encoding: Option<GrpcEncoding>,
+}
+
 pub struct Decoder {
     next_cache_index: usize,
-    dynamic_table: Vec<Option<usize>>,
+    dynamic_table: Vec<DynamicTableEntry>,
 
     huffman_paths: HashMap<Vec<u8>, usize>,
     plain_paths: HashMap<Vec<u8>, usize>,
@@ -145,10 +164,15 @@ impl Decoder {
         }
     }
 
-    pub fn find_path(&mut self, mut buf: &[u8]) -> Result<PathKind, Error> {
+    fn push_dynamic_entry(&mut self, path_cache: Option<usize>, encoding: Option<GrpcEncoding>) {
+        self.dynamic_table.push(DynamicTableEntry { path_cache, encoding });
+    }
+
+    pub fn find_path_and_encoding(&mut self, mut buf: &[u8]) -> Result<HeaderResult, Error> {
         use self::Representation::*;
 
         let mut find_path = Err(Error::NoPathSet);
+        let mut encoding = GrpcEncoding::Identity;
 
         while !buf.is_empty() {
             // At this point we are always at the beginning of the next block
@@ -165,17 +189,21 @@ impl Decoder {
                         }
 
                         let index = 61 + table_len - index;
-                        if let Some(cached) = &self.dynamic_table[index] {
+                        let entry = &self.dynamic_table[index];
+                        if let Some(cached) = &entry.path_cache {
                             find_path = Ok(PathKind::Cached(*cached));
+                        }
+                        if let Some(enc) = &entry.encoding {
+                            encoding = *enc;
                         }
                     }
                     adv
                 }
                 LiteralWithIndexing => {
-                    let (path, adv) = decode_literal_path(buf, true)?;
+                    let (header, adv) = decode_literal_header(buf, true, &self.dynamic_table)?;
 
-                    let opt_index = match path {
-                        Some(path) => {
+                    let (path_cache, hdr_encoding) = match header {
+                        HeaderMatch::Path(path) => {
                             let path_buf = match path {
                                 OutStr::Plain(path) => path.to_vec(),
                                 OutStr::Huffman(huff_path) => {
@@ -188,42 +216,57 @@ impl Decoder {
 
                             // the caller level should update the index too
                             self.next_cache_index += 1;
-                            Some(self.next_cache_index - 1)
+                            (Some(self.next_cache_index - 1), None)
                         }
-                        None => None,
+                        HeaderMatch::GrpcEncoding(val) => {
+                            let enc = val.to_encoding();
+                            if let Some(enc) = enc {
+                                encoding = enc;
+                            }
+                            (None, enc)
+                        }
+                        HeaderMatch::None => (None, None),
                     };
-                    self.dynamic_table.push(opt_index);
+                    self.push_dynamic_entry(path_cache, hdr_encoding);
 
                     adv
                 }
                 LiteralWithoutIndexing | LiteralNeverIndexed => {
-                    let (path, adv) = decode_literal_path(buf, false)?;
+                    let (header, adv) = decode_literal_header(buf, false, &self.dynamic_table)?;
 
-                    if let Some(path) = path {
-                        find_path = Ok(match path {
-                            OutStr::Plain(path) => match self.plain_paths.get(path) {
-                                Some(cached) => PathKind::Cached(*cached),
-                                None => {
-                                    let cached = self.next_cache_index;
-                                    self.next_cache_index += 1;
-                                    self.plain_paths.insert(path.to_vec(), cached);
+                    match header {
+                        HeaderMatch::Path(path) => {
+                            find_path = Ok(match path {
+                                OutStr::Plain(path) => match self.plain_paths.get(path) {
+                                    Some(cached) => PathKind::Cached(*cached),
+                                    None => {
+                                        let cached = self.next_cache_index;
+                                        self.next_cache_index += 1;
+                                        self.plain_paths.insert(path.to_vec(), cached);
 
-                                    PathKind::Plain(path.to_vec())
-                                }
-                            },
-                            OutStr::Huffman(huff_path) => match self.huffman_paths.get(huff_path) {
-                                Some(cached) => PathKind::Cached(*cached),
-                                None => {
-                                    let cached = self.next_cache_index;
-                                    self.next_cache_index += 1;
-                                    self.huffman_paths.insert(huff_path.to_vec(), cached);
+                                        PathKind::Plain(path.to_vec())
+                                    }
+                                },
+                                OutStr::Huffman(huff_path) => match self.huffman_paths.get(huff_path) {
+                                    Some(cached) => PathKind::Cached(*cached),
+                                    None => {
+                                        let cached = self.next_cache_index;
+                                        self.next_cache_index += 1;
+                                        self.huffman_paths.insert(huff_path.to_vec(), cached);
 
-                                    let mut plain = Vec::with_capacity(32);
-                                    huffman::decode(huff_path, &mut plain)?;
-                                    PathKind::Plain(plain)
-                                }
-                            },
-                        });
+                                        let mut plain = Vec::with_capacity(32);
+                                        huffman::decode(huff_path, &mut plain)?;
+                                        PathKind::Plain(plain)
+                                    }
+                                },
+                            });
+                        }
+                        HeaderMatch::GrpcEncoding(val) => {
+                            if let Some(enc) = val.to_encoding() {
+                                encoding = enc;
+                            }
+                        }
+                        HeaderMatch::None => {}
                     }
                     adv
                 }
@@ -235,7 +278,10 @@ impl Decoder {
             buf = &buf[adv..];
         }
 
-        find_path
+        Ok(HeaderResult {
+            path: find_path?,
+            encoding,
+        })
     }
 }
 
@@ -258,12 +304,69 @@ impl<'a> OutStr<'a> {
             }
         }
     }
+
+    fn to_encoding(&self) -> Option<GrpcEncoding> {
+        match self {
+            Self::Plain(out) => match *out {
+                b"gzip" => Some(GrpcEncoding::Gzip),
+                b"deflate" => Some(GrpcEncoding::Deflate),
+                b"zstd" => Some(GrpcEncoding::Zstd),
+                _ => None,
+            },
+            Self::Huffman(out) => {
+                let mut plain = Vec::with_capacity(16);
+                // If huffman decode fails, just return None
+                huffman::decode(out, &mut plain).ok()?;
+                match plain.as_slice() {
+                    b"gzip" => Some(GrpcEncoding::Gzip),
+                    b"deflate" => Some(GrpcEncoding::Deflate),
+                    b"zstd" => Some(GrpcEncoding::Zstd),
+                    _ => None,
+                }
+            }
+        }
+    }
 }
 
-fn decode_literal_path<'a>(
+enum HeaderMatch<'a> {
+    Path(OutStr<'a>),
+    GrpcEncoding(OutStr<'a>),
+    None,
+}
+
+enum HeaderName {
+    Path,
+    GrpcEncoding,
+    Other,
+}
+
+fn classify_table_index(table_idx: usize, dynamic_table: &[DynamicTableEntry]) -> HeaderName {
+    // Static table indices
+    if table_idx <= 61 {
+        // Static table index 4 = :path, 5 = :path
+        return if table_idx == 4 || table_idx == 5 {
+            HeaderName::Path
+        } else {
+            HeaderName::Other
+        };
+    }
+    // Dynamic table
+    let dyn_idx = 61 + dynamic_table.len() - table_idx;
+    let entry = &dynamic_table[dyn_idx];
+    if entry.path_cache.is_some() {
+        HeaderName::Path
+    } else if entry.encoding.is_some() {
+        HeaderName::GrpcEncoding
+    } else {
+        HeaderName::Other
+    }
+}
+
+fn decode_literal_header<'a>(
     mut buf: &'a [u8],
     index: bool,
-) -> Result<(Option<OutStr<'a>>, usize), Error> {
+    dynamic_table: &[DynamicTableEntry],
+) -> Result<(HeaderMatch<'a>, usize), Error> {
     let prefix = if index { 6 } else { 4 };
 
     // Extract the table index for the name, or 0 if not indexed
@@ -278,19 +381,21 @@ fn decode_literal_path<'a>(
         let adv = index_adv + name_adv + value_adv;
 
         if name_str.eq_str(":path") {
-            Ok((Some(value_str), adv))
+            Ok((HeaderMatch::Path(value_str), adv))
+        } else if name_str.eq_str("grpc-encoding") {
+            Ok((HeaderMatch::GrpcEncoding(value_str), adv))
         } else {
-            Ok((None, adv))
+            Ok((HeaderMatch::None, adv))
         }
     } else {
         // name is indexed, so parse value only
         let (value_str, value_adv) = decode_string(buf)?;
 
         let adv = index_adv + value_adv;
-        if table_idx == 4 || table_idx == 5 {
-            Ok((Some(value_str), adv))
-        } else {
-            Ok((None, adv))
+        match classify_table_index(table_idx, dynamic_table) {
+            HeaderName::Path => Ok((HeaderMatch::Path(value_str), adv)),
+            HeaderName::GrpcEncoding => Ok((HeaderMatch::GrpcEncoding(value_str), adv)),
+            HeaderName::Other => Ok((HeaderMatch::None, adv)),
         }
     }
 }
