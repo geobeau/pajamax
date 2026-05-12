@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use compio::io::AsyncReadManaged;
 use compio::net::{TcpListener, TcpStream};
-use compio::runtime::BufferPool;
+use futures_util::StreamExt;
 
 use crate::config::Config;
 use crate::error::Error;
@@ -100,8 +100,6 @@ pub async fn accept_loop(
     let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
     info!("listening on {}", addr);
 
-    let buffer_pool = Rc::new(BufferPool::new(config.buffer_pool_size, config.max_frame_size * 2)?);
-
     let concurrent = Rc::new(std::cell::Cell::new(0usize));
     let mut connections = 0;
     loop {
@@ -119,11 +117,10 @@ pub async fn accept_loop(
 
         let services = services.clone();
         let concurrent = concurrent.clone();
-        let buffer_pool = buffer_pool.clone();
         connections += 1;
         println!("Handled {connections} connections");
         compio::runtime::spawn(async move {
-            match handle_connection(services, stream, config, buffer_pool).await {
+            match handle_connection(services, stream, config).await {
                 Ok(_) => println!("connection closed"),
                 Err(err) => println!("connection fail: {:?}", err),
             }
@@ -152,11 +149,13 @@ async fn balanced_loop(
     let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
     info!("listening on {}", addr);
 
-    // Accept task: accepts connections and dispatches to balancer round-robin
+    // Accept task: AcceptMulti drains a burst of accepts per kernel wakeup and
+    // dispatches each to the balancer round-robin. The balancer hop is preserved.
     compio::runtime::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _peer)) => {
+        let mut incoming = listener.incoming();
+        while let Some(res) = incoming.next().await {
+            match res {
+                Ok(stream) => {
                     let owned_fd = match std::os::fd::AsFd::as_fd(&stream).try_clone_to_owned() {
                         Ok(fd) => fd,
                         Err(e) => {
@@ -175,8 +174,7 @@ async fn balanced_loop(
         }
     }).detach();
 
-    // Worker loop: receive connections from balancer channel via flume async
-    let buffer_pool = Rc::new(BufferPool::new(config.buffer_pool_size, config.max_frame_size * 2)?);
+    // Worker loop: receive connections from balancer channel via flume async.
 
     let concurrent = Rc::new(std::cell::Cell::new(0usize));
     let mut connections = 0;
@@ -194,11 +192,10 @@ async fn balanced_loop(
 
         let services = services.clone();
         let concurrent = concurrent.clone();
-        let buffer_pool = buffer_pool.clone();
         connections += 1;
         println!("Handled {connections} connections");
         compio::runtime::spawn(async move {
-            match handle_connection(services, stream, config, buffer_pool).await {
+            match handle_connection(services, stream, config).await {
                 Ok(_) => println!("connection closed"),
                 Err(err) => println!("connection fail: {:?}", err),
             }
@@ -221,7 +218,6 @@ async fn handle_connection(
     services: Vec<Rc<dyn PajamaxService>>,
     stream: TcpStream,
     config: Config,
-    buffer_pool: Rc<BufferPool>,
 ) -> Result<(), Error> {
     // Handshake on full stream before splitting
     let mut stream = stream;
@@ -264,13 +260,14 @@ async fn handle_connection(
     let mut stream_data_lens: Vec<(u32, usize)> = Vec::new();
 
     loop {
-        let managed_buf = match stream.read_managed(&buffer_pool, 0).await {
-            Ok(buf) if buf.len() == 0 => return Ok(()), // connection closed
-            Ok(buf) => buf,
+        let managed_buf = match stream.read_managed(0).await {
+            Ok(None) => return Ok(()), // EOF / connection closed
+            Ok(Some(buf)) if buf.is_empty() => return Ok(()),
+            Ok(Some(buf)) => buf,
             Err(e) => return Err(Error::IoFail(e)),
         };
         let len = managed_buf.len();
-        let read_buf = managed_buf.as_ref();
+        let read_buf: &[u8] = &managed_buf;
 
         trace!("receive data {len}");
 

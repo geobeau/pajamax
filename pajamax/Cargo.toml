@@ -13,7 +13,8 @@ categories = ["network-programming"]
 [dependencies]
 prost = "0.14"
 bytes = "1"
-compio = { version = "0.18", features = ["io", "net", "runtime"] }
+compio = { git = "https://github.com/compio-rs/compio", rev = "b06ff34caaa24c516821fe16da50191834524660", features = ["io", "net", "runtime"] }
+futures-util = { version = "0.3", default-features = false }
 local-sync = "0.1"
 log = { version = "0.4", optional = true }
 async-trait = "0.1"
